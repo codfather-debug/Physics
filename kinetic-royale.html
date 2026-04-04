@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kinetic Royale</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            player: { bg: '#1a3a5c', border: '#00aaff', text: '#60c8ff' },
+            ai: { bg: '#5c1a1a', border: '#ff4444', text: '#ff8888' },
+            win: '#22c55e', loss: '#ef4444', tie: '#f59e0b',
+            arena: '#111827'
+          }
+        }
+      }
+    };
+  </script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background: #0f172a; margin: 0; color: #f8fafc; }
+    input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 9999px; background: #1e293b; outline: none; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #38bdf8; cursor: pointer; border: 2px solid #0f172a; }
+    input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #38bdf8; cursor: pointer; border: 2px solid #0f172a; }
+    .unit-anim { transition: transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94); }
+    .flash-green { animation: flashGreen 0.6s ease-out; }
+    .flash-red { animation: flashRed 0.6s ease-out; }
+    @keyframes flashGreen { 0%,100% { background: transparent; } 40% { background: rgba(34,197,94,0.2); } }
+    @keyframes flashRed { 0%,100% { background: transparent; } 40% { background: rgba(239,68,68,0.2); } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    // --- Physics ---
+    function elasticCollision(m1, v1, m2, v2) {
+      // v2 is already signed (negative = moving left)
+      const v1p = ((m1 - m2) * v1 + 2 * m2 * v2) / (m1 + m2);
+      const v2p = ((m2 - m1) * v2 + 2 * m1 * v1) / (m1 + m2);
+      return { v1p, v2p };
+    }
+
+    function inelasticCollision(m1, v1, m2, v2) {
+      const vCombined = (m1 * v1 + m2 * v2) / (m1 + m2);
+      return { v1p: vCombined, v2p: vCombined };
+    }
+
+    function getResult(v1p) {
+      if (v1p > 0.01) return 'WIN';
+      if (v1p < -0.01) return 'LOSS';
+      return 'TIE';
+    }
+
+    // Preset unit configs
+    const PRESETS = {
+      boulder: { mass: 80, vel: 5, label: 'The Boulder', color: '#7c3aed', emoji: '🪨' },
+      dart:    { mass: 10, vel: 40, label: 'The Dart',    color: '#0891b2', emoji: '🎯' },
+      custom:  { label: 'Custom', color: '#475569', emoji: '⚙️' }
+    };
+
+    const LANE_COLORS = ['#0ea5e9', '#f59e0b'];
+    const AI_COLORS = ['#ef4444', '#ec4899'];
+
+    const DEFAULT_LANES = [
+      { playerMass: 50, playerVel: 20, aiMass: 40, aiVel: 15, preset: 'custom', animState: 'idle', result: null, v1p: null },
+      { playerMass: 10, playerVel: 40, aiMass: 80, aiVel: 5,  preset: 'custom', animState: 'idle', result: null, v1p: null }
+    ];
+
+    // --- Sub-components ---
+
+    function Toggle({ checked, onChange, leftLabel, rightLabel }) {
+      return (
+        <div className="flex items-center gap-3">
+          <span className={`text-xs font-semibold ${!checked ? 'text-white' : 'text-slate-500'}`}>{leftLabel}</span>
+          <button
+            onClick={() => onChange(!checked)}
+            className={`relative inline-flex h-6 w-12 items-center rounded-full transition-colors ${checked ? 'bg-sky-500' : 'bg-violet-600'}`}
+          >
+            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${checked ? 'translate-x-7' : 'translate-x-1'}`} />
+          </button>
+          <span className={`text-xs font-semibold ${checked ? 'text-white' : 'text-slate-500'}`}>{rightLabel}</span>
+        </div>
+      );
+    }
+
+    function MomentumBadge({ mass, vel, side, color }) {
+      const p = (mass * vel).toFixed(0);
+      const sign = side === 'ai' ? '-' : '+';
+      return (
+        <div className="text-center">
+          <div className="text-xs font-bold px-2 py-0.5 rounded-full inline-block" style={{background:'rgba(0,0,0,0.4)', color, border:`1px solid ${color}`, fontSize:'10px'}}>
+            p = {sign}{p} kg·m/s
+          </div>
+        </div>
+      );
+    }
+
+    function UnitCard({ side, preset, mass, vel, color, laneIdx, animOffset, result }) {
+      const isPlayer = side === 'player';
+      const label = isPlayer ? `P${laneIdx + 1}` : `AI${laneIdx + 1}`;
+      const emoji = preset && PRESETS[preset] ? PRESETS[preset].emoji : (isPlayer ? '🟦' : '🟥');
+      const bgColor = isPlayer ? LANE_COLORS[laneIdx] : AI_COLORS[laneIdx];
+
+      const style = {
+        transform: `translateX(${animOffset}px)`,
+        transition: 'transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94)'
+      };
+
+      return (
+        <div className="flex flex-col items-center gap-1" style={style}>
+          <MomentumBadge mass={mass} vel={vel} side={side} color={bgColor} />
+          <div className="rounded-xl flex flex-col items-center justify-center w-16 h-16 font-bold text-white shadow-lg"
+               style={{background: bgColor, border:`2px solid ${bgColor}`, fontSize:'11px'}}>
+            <span style={{fontSize:'24px'}}>{emoji}</span>
+            <span style={{fontSize:'9px', marginTop:'2px'}}>{label}</span>
+          </div>
+          <div className="text-center" style={{fontSize:'9px', color:'#94a3b8'}}>
+            <div>{mass}kg</div>
+            <div>{vel}m/s {isPlayer ? '→' : '←'}</div>
+          </div>
+        </div>
+      );
+    }
+
+    function Lane({ lane, laneIdx, isAnimating }) {
+      const { playerMass, playerVel, aiMass, aiVel, preset, animState, result, v1p } = lane;
+
+      // Compute animation offsets
+      let playerOffset = 0;
+      let aiOffset = 0;
+      if (animState === 'approaching') {
+        playerOffset = 30;
+        aiOffset = -30;
+      } else if (animState === 'post') {
+        if (result === 'WIN') {
+          playerOffset = 60;
+          aiOffset = 20;
+        } else if (result === 'LOSS') {
+          playerOffset = -20;
+          aiOffset = -60;
+        } else {
+          playerOffset = 5;
+          aiOffset = -5;
+        }
+      }
+
+      const flashClass = animState === 'post'
+        ? (result === 'WIN' ? 'flash-green' : result === 'LOSS' ? 'flash-red' : '')
+        : '';
+
+      return (
+        <div className={`rounded-xl p-4 ${flashClass}`} style={{background:'#1e293b', border:'2px solid #334155'}}>
+          <div className="flex items-center justify-between">
+            {/* Player side */}
+            <div className="flex-1 flex justify-start">
+              <UnitCard side="player" preset={preset} mass={playerMass} vel={playerVel} color={LANE_COLORS[laneIdx]} laneIdx={laneIdx} animOffset={playerOffset} result={result} />
+            </div>
+
+            {/* Center info */}
+            <div className="flex flex-col items-center gap-1 px-4" style={{minWidth:'120px'}}>
+              <div className="text-xs font-bold" style={{color:'#64748b'}}>LANE {laneIdx + 1}</div>
+              {animState === 'post' && result && (
+                <div className="font-bold text-sm px-3 py-1 rounded-full" style={{
+                  color: result === 'WIN' ? '#22c55e' : result === 'LOSS' ? '#ef4444' : '#f59e0b',
+                  background: result === 'WIN' ? 'rgba(34,197,94,0.15)' : result === 'LOSS' ? 'rgba(239,68,68,0.15)' : 'rgba(245,158,11,0.15)',
+                  border: `1px solid ${result === 'WIN' ? '#22c55e' : result === 'LOSS' ? '#ef4444' : '#f59e0b'}`
+                }}>
+                  {result}
+                </div>
+              )}
+              {animState === 'post' && v1p !== null && (
+                <div style={{fontSize:'9px', color:'#64748b'}}>
+                  v₁' = {v1p.toFixed(1)} m/s
+                </div>
+              )}
+              {animState !== 'post' && (
+                <div style={{fontSize:'9px', color:'#334155'}}>
+                  p_net = {((playerMass * playerVel) - (aiMass * aiVel)).toFixed(0)} kg·m/s
+                </div>
+              )}
+              {/* Collision arrow */}
+              <div className="flex items-center gap-1" style={{color:'#475569'}}>
+                <span style={{fontSize:'18px'}}>→</span>
+                <span style={{fontSize:'11px', color:'#ef4444'}}>💥</span>
+                <span style={{fontSize:'18px'}}>←</span>
+              </div>
+            </div>
+
+            {/* AI side */}
+            <div className="flex-1 flex justify-end">
+              <UnitCard side="ai" preset="custom" mass={aiMass} vel={aiVel} color={AI_COLORS[laneIdx]} laneIdx={laneIdx} animOffset={aiOffset} result={result} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LaneConfigPanel({ lane, laneIdx, onChange, isAnimating }) {
+      const { playerMass, playerVel, aiMass, aiVel, preset } = lane;
+
+      const applyPreset = (presetKey) => {
+        const p = PRESETS[presetKey];
+        onChange(laneIdx, { ...lane, playerMass: p.mass, playerVel: p.vel, preset: presetKey });
+      };
+
+      const update = (field, val) => {
+        onChange(laneIdx, { ...lane, [field]: val, preset: 'custom' });
+      };
+
+      return (
+        <div className="rounded-xl p-4 space-y-3" style={{background:'#1e293b', border:'2px solid #334155'}}>
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-bold" style={{color: LANE_COLORS[laneIdx]}}>LANE {laneIdx + 1} — PLAYER UNIT</span>
+            <div className="flex gap-2">
+              {['boulder', 'dart'].map(p => (
+                <button
+                  key={p}
+                  onClick={() => applyPreset(p)}
+                  disabled={isAnimating}
+                  className="text-xs px-2 py-1 rounded-lg font-semibold transition-all"
+                  style={{
+                    background: preset === p ? PRESETS[p].color : '#0f172a',
+                    color: preset === p ? '#fff' : '#94a3b8',
+                    border: `1px solid ${preset === p ? PRESETS[p].color : '#334155'}`,
+                    cursor: isAnimating ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  {PRESETS[p].emoji} {PRESETS[p].label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <div className="flex justify-between text-xs mb-1" style={{color:'#94a3b8'}}>
+                <span>Mass (m₁)</span>
+                <span className="font-bold text-white">{playerMass} kg</span>
+              </div>
+              <input type="range" min="1" max="100" value={playerMass}
+                onChange={e => update('playerMass', Number(e.target.value))}
+                disabled={isAnimating} />
+            </div>
+            <div>
+              <div className="flex justify-between text-xs mb-1" style={{color:'#94a3b8'}}>
+                <span>Velocity (v₁)</span>
+                <span className="font-bold text-white">{playerVel} m/s</span>
+              </div>
+              <input type="range" min="1" max="50" value={playerVel}
+                onChange={e => update('playerVel', Number(e.target.value))}
+                disabled={isAnimating} />
+            </div>
+          </div>
+
+          <div className="pt-2 border-t" style={{borderColor:'#334155'}}>
+            <span className="text-xs font-semibold" style={{color: AI_COLORS[laneIdx]}}>AI UNIT</span>
+            <div className="grid grid-cols-2 gap-4 mt-2">
+              <div>
+                <div className="flex justify-between text-xs mb-1" style={{color:'#94a3b8'}}>
+                  <span>Mass (m₂)</span>
+                  <span className="font-bold text-white">{aiMass} kg</span>
+                </div>
+                <input type="range" min="1" max="100" value={aiMass}
+                  onChange={e => update('aiMass', Number(e.target.value))}
+                  disabled={isAnimating} style={{'--thumb-color': AI_COLORS[laneIdx]}} />
+              </div>
+              <div>
+                <div className="flex justify-between text-xs mb-1" style={{color:'#94a3b8'}}>
+                  <span>Velocity (v₂)</span>
+                  <span className="font-bold text-white">{aiVel} m/s ←</span>
+                </div>
+                <input type="range" min="1" max="50" value={aiVel}
+                  onChange={e => update('aiVel', Number(e.target.value))}
+                  disabled={isAnimating} />
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function DataTable({ log }) {
+      return (
+        <div className="rounded-xl overflow-hidden" style={{border:'2px solid #334155'}}>
+          <div className="px-4 py-2 text-xs font-bold" style={{background:'#0f172a', color:'#64748b'}}>
+            COLLISION LOG (LAST 5)
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs" style={{borderCollapse:'collapse'}}>
+              <thead>
+                <tr style={{background:'#1e293b'}}>
+                  {['Lane', 'Type', 'm₁ (kg)', 'v₁ (m/s)', 'm₂ (kg)', 'v₂ (m/s)', 'v₁\' (m/s)', 'p_net', 'Result'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left font-semibold" style={{color:'#64748b', borderBottom:'1px solid #334155', whiteSpace:'nowrap'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {log.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="px-4 py-6 text-center" style={{color:'#334155'}}>
+                      No collisions yet — launch units to begin
+                    </td>
+                  </tr>
+                ) : log.map(row => (
+                  <tr key={row.id} style={{borderBottom:'1px solid #1e293b'}}>
+                    <td className="px-3 py-2 font-bold" style={{color: LANE_COLORS[row.laneIdx]}}>{row.laneIdx + 1}</td>
+                    <td className="px-3 py-2" style={{color:'#94a3b8', whiteSpace:'nowrap', fontSize:'10px'}}>{row.elasticityLabel}</td>
+                    <td className="px-3 py-2" style={{color:'#60a5fa'}}>{row.m1}</td>
+                    <td className="px-3 py-2" style={{color:'#60a5fa'}}>{row.v1}</td>
+                    <td className="px-3 py-2" style={{color:'#f87171'}}>{row.m2}</td>
+                    <td className="px-3 py-2" style={{color:'#f87171'}}>{row.v2}</td>
+                    <td className="px-3 py-2 font-mono" style={{color:'#e2e8f0'}}>{row.v1p.toFixed(2)}</td>
+                    <td className="px-3 py-2 font-mono" style={{color:'#94a3b8'}}>{row.pNet.toFixed(1)}</td>
+                    <td className="px-3 py-2 font-bold" style={{color: row.result === 'WIN' ? '#22c55e' : row.result === 'LOSS' ? '#ef4444' : '#f59e0b'}}>
+                      {row.result}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [elastic, setElastic] = useState(false); // false = inelastic, true = elastic
+      const [lanes, setLanes] = useState(DEFAULT_LANES.map(l => ({...l})));
+      const [collisionLog, setCollisionLog] = useState([]);
+      const [isAnimating, setIsAnimating] = useState(false);
+      const animTimerRef = useRef(null);
+
+      const updateLane = (idx, updated) => {
+        setLanes(prev => prev.map((l, i) => i === idx ? { ...updated, animState: 'idle', result: null, v1p: null } : l));
+      };
+
+      const handleLaunch = () => {
+        if (isAnimating) return;
+        setIsAnimating(true);
+
+        // Phase 1: approaching
+        setLanes(prev => prev.map(l => ({ ...l, animState: 'approaching', result: null, v1p: null })));
+
+        animTimerRef.current = setTimeout(() => {
+          // Compute collisions
+          const results = lanes.map((lane, i) => {
+            const { playerMass: m1, playerVel: v1, aiMass: m2, aiVel: v2 } = lane;
+            const v2_signed = -v2; // AI moves left
+
+            let v1p, v2p;
+            if (elastic) {
+              ({ v1p, v2p } = elasticCollision(m1, v1, m2, v2_signed));
+            } else {
+              ({ v1p, v2p } = inelasticCollision(m1, v1, m2, v2_signed));
+            }
+
+            const result = getResult(v1p);
+            const pNet = m1 * v1 + m2 * v2_signed;
+
+            return { v1p, v2p, result, pNet, m1, v1, m2, v2, laneIdx: i };
+          });
+
+          // Phase 2: post-collision
+          setLanes(prev => prev.map((l, i) => ({
+            ...l,
+            animState: 'post',
+            result: results[i].result,
+            v1p: results[i].v1p
+          })));
+
+          // Log results
+          setCollisionLog(prev => {
+            const newEntries = results.map(r => ({
+              id: Date.now() + r.laneIdx,
+              laneIdx: r.laneIdx,
+              elasticityLabel: elastic ? 'Elastic' : 'Inelastic',
+              m1: r.m1, v1: r.v1, m2: r.m2, v2: r.v2,
+              v1p: r.v1p, pNet: r.pNet, result: r.result
+            }));
+            return [...newEntries, ...prev].slice(0, 5);
+          });
+
+          animTimerRef.current = setTimeout(() => {
+            setIsAnimating(false);
+          }, 1200);
+        }, 600);
+      };
+
+      const handleReset = () => {
+        if (animTimerRef.current) clearTimeout(animTimerRef.current);
+        setIsAnimating(false);
+        setLanes(DEFAULT_LANES.map(l => ({...l})));
+        setCollisionLog([]);
+      };
+
+      // Live momentum calculations for display
+      const liveStats = lanes.map(l => ({
+        p1: l.playerMass * l.playerVel,
+        p2: l.aiMass * l.aiVel,
+        pNet: l.playerMass * l.playerVel - l.aiMass * l.aiVel
+      }));
+
+      return (
+        <div className="min-h-screen py-6 px-4" style={{background:'#0f172a'}}>
+          <div className="max-w-3xl mx-auto space-y-5">
+
+            {/* Header */}
+            <div className="text-center">
+              <h1 className="text-3xl font-black tracking-tight bg-clip-text text-transparent"
+                  style={{backgroundImage:'linear-gradient(135deg, #38bdf8, #818cf8, #f472b6)'}}>
+                KINETIC ROYALE
+              </h1>
+              <p className="text-sm mt-1" style={{color:'#64748b'}}>Momentum &amp; Collision Lab</p>
+            </div>
+
+            {/* Controls row */}
+            <div className="flex items-center justify-between flex-wrap gap-4 p-4 rounded-xl" style={{background:'#1e293b', border:'2px solid #334155'}}>
+              <Toggle
+                checked={elastic}
+                onChange={setElastic}
+                leftLabel="Inelastic"
+                rightLabel="Elastic"
+              />
+              <div className="flex gap-3">
+                <button
+                  onClick={handleLaunch}
+                  disabled={isAnimating}
+                  className="font-bold px-6 py-2 rounded-xl transition-all text-sm"
+                  style={{
+                    background: isAnimating ? '#1e293b' : 'linear-gradient(135deg, #0ea5e9, #6366f1)',
+                    color: isAnimating ? '#475569' : '#fff',
+                    border: isAnimating ? '2px solid #334155' : '2px solid transparent',
+                    cursor: isAnimating ? 'not-allowed' : 'pointer',
+                    boxShadow: isAnimating ? 'none' : '0 0 20px rgba(99,102,241,0.4)'
+                  }}
+                >
+                  {isAnimating ? 'Simulating...' : '⚡ LAUNCH UNITS'}
+                </button>
+                <button
+                  onClick={handleReset}
+                  className="font-bold px-4 py-2 rounded-xl text-sm transition-all"
+                  style={{background:'#0f172a', color:'#64748b', border:'2px solid #334155', cursor:'pointer'}}
+                >
+                  Reset Arena
+                </button>
+              </div>
+            </div>
+
+            {/* Physics equation banner */}
+            <div className="text-center py-2 rounded-lg text-xs" style={{background:'rgba(99,102,241,0.1)', color:'#818cf8', border:'1px solid rgba(99,102,241,0.2)'}}>
+              {elastic
+                ? 'Elastic: v₁\' = ((m₁−m₂)v₁ + 2m₂v₂) / (m₁+m₂)'
+                : 'Inelastic: v_combined = (m₁v₁ + m₂v₂) / (m₁+m₂)'}
+            </div>
+
+            {/* Lanes */}
+            <div className="space-y-3">
+              {lanes.map((lane, i) => (
+                <Lane key={i} lane={lane} laneIdx={i} isAnimating={isAnimating} />
+              ))}
+            </div>
+
+            {/* Config panels */}
+            <div className="space-y-3">
+              {lanes.map((lane, i) => (
+                <LaneConfigPanel key={i} lane={lane} laneIdx={i} onChange={updateLane} isAnimating={isAnimating} />
+              ))}
+            </div>
+
+            {/* Live momentum summary */}
+            <div className="grid grid-cols-2 gap-3">
+              {liveStats.map((s, i) => (
+                <div key={i} className="p-3 rounded-xl text-xs space-y-1" style={{background:'#1e293b', border:'1px solid #334155'}}>
+                  <div className="font-bold mb-2" style={{color: LANE_COLORS[i]}}>LANE {i + 1} MOMENTUM</div>
+                  <div className="flex justify-between">
+                    <span style={{color:'#94a3b8'}}>Player p₁</span>
+                    <span className="font-mono" style={{color:'#60a5fa'}}>+{s.p1.toFixed(0)} kg·m/s</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span style={{color:'#94a3b8'}}>AI p₂</span>
+                    <span className="font-mono" style={{color:'#f87171'}}>−{s.p2.toFixed(0)} kg·m/s</span>
+                  </div>
+                  <div className="flex justify-between pt-1" style={{borderTop:'1px solid #334155'}}>
+                    <span style={{color:'#94a3b8'}}>Net p</span>
+                    <span className="font-mono font-bold" style={{color: s.pNet > 0 ? '#22c55e' : s.pNet < 0 ? '#ef4444' : '#f59e0b'}}>
+                      {s.pNet > 0 ? '+' : ''}{s.pNet.toFixed(0)} kg·m/s
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <DataTable log={collisionLog} />
+
+            <div className="text-center pb-4 text-xs" style={{color:'#334155'}}>
+              p = mv &nbsp;|&nbsp; Conservation of Momentum &nbsp;|&nbsp; g = 9.8 m/s²
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

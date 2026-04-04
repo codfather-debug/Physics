@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gridiron Dynamics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { pixel: ['"Press Start 2P"', 'monospace'] },
+          colors: {
+            field: { dark: '#1a5c2a', mid: '#1e6b30', light: '#227735' },
+            retro: {
+              green: '#00ff41', yellow: '#ffe600', red: '#ff3131',
+              blue: '#00aaff', brown: '#8b5e3c', white: '#f0f0e8',
+              bg: '#0d0d0d', panel: '#1a1a2e', border: '#2a2a4a'
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background: #0d0d0d; margin: 0; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #1a1a2e; }
+    ::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 3px; }
+    input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 3px; background: #2a2a4a; outline: none; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 0; background: #00ff41; cursor: pointer; border: 2px solid #0d0d0d; image-rendering: pixelated; }
+    input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 0; background: #00ff41; cursor: pointer; border: 2px solid #0d0d0d; }
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    const G = 9.8; // m/s²
+    const CANVAS_W = 700;
+    const CANVAS_H = 280;
+    const GROUND_Y = 40;       // pixels from bottom reserved as ground
+    const SCALE = 8.5;         // pixels per meter
+    const QB_X_M = 2;          // QB position in meters from left
+    const CATCH_MIN_Y = 0.4;   // meters — minimum catch height
+    const CATCH_MAX_Y = 2.8;   // meters — maximum catch height
+
+    // --- Pure physics functions ---
+    function toRad(deg) { return deg * Math.PI / 180; }
+
+    function ballPos(t, vi, angleDeg) {
+      const a = toRad(angleDeg);
+      const vx = vi * Math.cos(a);
+      const vy0 = vi * Math.sin(a);
+      const x = vx * t;
+      const y = vy0 * t - 0.5 * G * t * t;
+      const vy = vy0 - G * t;
+      return { x, y, vx, vy };
+    }
+
+    function maxRange(vi, angleDeg) {
+      const a = toRad(angleDeg);
+      const vy0 = vi * Math.sin(a);
+      if (vy0 <= 0) return 0;
+      const tFlight = 2 * vy0 / G;
+      return vi * Math.cos(a) * tFlight;
+    }
+
+    // --- Canvas drawing ---
+    function worldToCanvas(x_m, y_m) {
+      // x_m is relative to QB
+      const cx = (QB_X_M + x_m) * SCALE;
+      const cy = CANVAS_H - GROUND_Y - y_m * SCALE;
+      return { cx, cy };
+    }
+
+    function drawField(ctx, receiverDist) {
+      // Sky gradient
+      const skyGrad = ctx.createLinearGradient(0, 0, 0, CANVAS_H - GROUND_Y);
+      skyGrad.addColorStop(0, '#050a1a');
+      skyGrad.addColorStop(1, '#0a1a35');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H - GROUND_Y);
+
+      // Field stripes
+      const stripeW = SCALE * 5; // 5 meters wide
+      for (let i = 0; i < Math.ceil(CANVAS_W / stripeW); i++) {
+        ctx.fillStyle = i % 2 === 0 ? '#1a5c2a' : '#1e6b30';
+        ctx.fillRect(i * stripeW, CANVAS_H - GROUND_Y, stripeW, GROUND_Y);
+      }
+
+      // Yard lines (every 10 meters)
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 1;
+      for (let m = 0; m < CANVAS_W / SCALE; m += 10) {
+        const x = m * SCALE;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, CANVAS_H);
+        ctx.stroke();
+      }
+
+      // Hash marks
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth = 1;
+      for (let m = 0; m < CANVAS_W / SCALE; m += 2) {
+        const x = m * SCALE;
+        ctx.beginPath();
+        ctx.moveTo(x, CANVAS_H - GROUND_Y - 3);
+        ctx.lineTo(x, CANVAS_H - GROUND_Y + 3);
+        ctx.stroke();
+      }
+
+      // Ground line
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, CANVAS_H - GROUND_Y);
+      ctx.lineTo(CANVAS_W, CANVAS_H - GROUND_Y);
+      ctx.stroke();
+
+      // Receiver zone highlight
+      const rxCanvas = worldToCanvas(receiverDist, 0);
+      ctx.fillStyle = 'rgba(255,230,0,0.08)';
+      ctx.fillRect(rxCanvas.cx - 15, 0, 30, CANVAS_H - GROUND_Y);
+    }
+
+    function drawQB(ctx) {
+      const { cx, cy } = worldToCanvas(0, 0);
+      // Body
+      ctx.fillStyle = '#3a6bc4';
+      ctx.fillRect(cx - 6, cy - 28, 12, 14);
+      // Helmet
+      ctx.fillStyle = '#3a6bc4';
+      ctx.fillRect(cx - 5, cy - 40, 10, 12);
+      ctx.fillStyle = '#c8a830';
+      ctx.fillRect(cx - 5, cy - 33, 10, 4); // facemask stripe
+      // Legs
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(cx - 6, cy - 14, 5, 14);
+      ctx.fillRect(cx + 1, cy - 14, 5, 14);
+      // Arm throwing
+      ctx.fillStyle = '#c8a830';
+      ctx.fillRect(cx + 4, cy - 30, 8, 4);
+      // Label
+      ctx.fillStyle = '#ffe600';
+      ctx.font = '7px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      ctx.fillText('QB', cx, cy - 44);
+    }
+
+    function drawReceiver(ctx, receiverDist, isCaught) {
+      const { cx, cy } = worldToCanvas(receiverDist, 0);
+      ctx.fillStyle = isCaught ? '#00ff41' : '#ff6600';
+      // Body
+      ctx.fillRect(cx - 5, cy - 28, 10, 14);
+      // Helmet
+      ctx.fillRect(cx - 5, cy - 40, 10, 12);
+      ctx.fillStyle = isCaught ? '#003311' : '#331100';
+      ctx.fillRect(cx - 5, cy - 33, 10, 4);
+      // Legs
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(cx - 5, cy - 14, 4, 14);
+      ctx.fillRect(cx + 1, cy - 14, 4, 14);
+      // Catch zone indicator
+      const minY = worldToCanvas(receiverDist, CATCH_MIN_Y).cy;
+      const maxY = worldToCanvas(receiverDist, CATCH_MAX_Y).cy;
+      ctx.strokeStyle = isCaught ? '#00ff41' : 'rgba(255,200,0,0.5)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.strokeRect(cx - 12, maxY, 24, minY - maxY);
+      ctx.setLineDash([]);
+      // Label
+      ctx.fillStyle = isCaught ? '#00ff41' : '#ffe600';
+      ctx.font = '7px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      ctx.fillText('WR', cx, cy - 44);
+      // Distance label
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.font = '6px "Press Start 2P"';
+      ctx.fillText(receiverDist + 'm', cx, CANVAS_H - GROUND_Y + 14);
+    }
+
+    function drawBall(ctx, trail, ballX_m, ballY_m) {
+      // Draw trail
+      for (let i = 0; i < trail.length; i++) {
+        const alpha = (i / trail.length) * 0.5;
+        const r = 2 + (i / trail.length) * 2;
+        ctx.beginPath();
+        ctx.arc(trail[i].cx, trail[i].cy, r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 180, 50, ${alpha})`;
+        ctx.fill();
+      }
+      // Draw football
+      const { cx, cy } = worldToCanvas(ballX_m, ballY_m);
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.fillStyle = '#8B4513';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 7, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-3, 0); ctx.lineTo(3, 0);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawResult(ctx, result) {
+      ctx.fillStyle = result === 'COMPLETE' ? 'rgba(0,255,65,0.15)' : 'rgba(255,49,49,0.15)';
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      ctx.fillStyle = result === 'COMPLETE' ? '#00ff41' : '#ff3131';
+      ctx.font = '20px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      ctx.fillText(result === 'COMPLETE' ? 'COMPLETE!' : 'INCOMPLETE', CANVAS_W / 2, CANVAS_H / 2 - 10);
+    }
+
+    // --- Components ---
+    function Header() {
+      return (
+        <div className="text-center py-4">
+          <h1 className="font-pixel text-retro-green text-lg tracking-widest" style={{textShadow: '0 0 20px #00ff41, 2px 2px 0 #003311'}}>
+            GRIDIRON DYNAMICS
+          </h1>
+          <p className="font-pixel text-xs mt-2" style={{color:'#4a8c5c'}}>PHYSICS-POWERED PASSING</p>
+        </div>
+      );
+    }
+
+    function VelocityOverlay({ vx, vy, isAnimating }) {
+      if (!isAnimating) return null;
+      return (
+        <div className="absolute top-2 right-2 font-pixel text-xs space-y-1 pointer-events-none" style={{zIndex:10}}>
+          <div className="px-2 py-1 rounded" style={{background:'rgba(0,0,0,0.7)', border:'1px solid #00aaff', color:'#00aaff'}}>
+            Vx = {vx.toFixed(1)} m/s →
+          </div>
+          <div className="px-2 py-1 rounded" style={{background:'rgba(0,0,0,0.7)', border:'1px solid #ff6600', color: vy >= 0 ? '#00ff41' : '#ff3131'}}>
+            Vy = {vy.toFixed(1)} m/s {vy >= 0 ? '↑' : '↓'}
+          </div>
+        </div>
+      );
+    }
+
+    function ControlPanel({ vi, setVi, angle, setAngle, onSimulate, onRandomize, isAnimating }) {
+      return (
+        <div className="grid grid-cols-2 gap-4 p-4 rounded-lg" style={{background:'#1a1a2e', border:'2px solid #2a2a4a'}}>
+          <div>
+            <label className="font-pixel text-xs mb-2 block" style={{color:'#00aaff'}}>
+              VELOCITY (v_i)
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min="1" max="50" value={vi}
+                onChange={e => setVi(Number(e.target.value))}
+                className="flex-1" disabled={isAnimating}
+              />
+              <span className="font-pixel text-xs w-16 text-right" style={{color:'#00ff41'}}>{vi} m/s</span>
+            </div>
+          </div>
+          <div>
+            <label className="font-pixel text-xs mb-2 block" style={{color:'#ff6600'}}>
+              ANGLE (θ)
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min="1" max="89" value={angle}
+                onChange={e => setAngle(Number(e.target.value))}
+                className="flex-1" disabled={isAnimating}
+              />
+              <span className="font-pixel text-xs w-16 text-right" style={{color:'#00ff41'}}>{angle}°</span>
+            </div>
+          </div>
+          <button
+            onClick={onSimulate}
+            disabled={isAnimating}
+            className="font-pixel text-xs py-3 px-4 rounded transition-all"
+            style={{
+              background: isAnimating ? '#1a1a2e' : '#003311',
+              color: isAnimating ? '#2a4a2a' : '#00ff41',
+              border: `2px solid ${isAnimating ? '#1a3a1a' : '#00ff41'}`,
+              cursor: isAnimating ? 'not-allowed' : 'pointer',
+              textShadow: isAnimating ? 'none' : '0 0 8px #00ff41'
+            }}
+          >
+            {isAnimating ? '[ SIMULATING... ]' : '[ SIMULATE ]'}
+          </button>
+          <button
+            onClick={onRandomize}
+            disabled={isAnimating}
+            className="font-pixel text-xs py-3 px-4 rounded transition-all"
+            style={{
+              background: '#130d2e',
+              color: isAnimating ? '#2a2a4a' : '#ffe600',
+              border: `2px solid ${isAnimating ? '#2a2a4a' : '#ffe600'}`,
+              cursor: isAnimating ? 'not-allowed' : 'pointer',
+              textShadow: isAnimating ? 'none' : '0 0 8px #ffe600'
+            }}
+          >
+            [ RANDOMIZE ]
+          </button>
+        </div>
+      );
+    }
+
+    function Scoreboard({ completions }) {
+      return (
+        <div className="flex items-center justify-center gap-6 p-3 rounded" style={{background:'#0a0a1a', border:'2px solid #2a2a4a'}}>
+          <span className="font-pixel text-xs" style={{color:'#4a4a7a'}}>COMPLETIONS</span>
+          <span className="font-pixel text-2xl" style={{color:'#00ff41', textShadow:'0 0 20px #00ff41'}}>
+            {String(completions).padStart(3, '0')}
+          </span>
+        </div>
+      );
+    }
+
+    function DataTable({ log }) {
+      return (
+        <div className="rounded-lg overflow-hidden" style={{border:'2px solid #2a2a4a'}}>
+          <div className="px-3 py-2" style={{background:'#0a0a1a'}}>
+            <span className="font-pixel text-xs" style={{color:'#4a4a7a'}}>ATTEMPT LOG (LAST 5)</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs font-pixel" style={{borderCollapse:'collapse'}}>
+              <thead>
+                <tr style={{background:'#151530'}}>
+                  {['v_i (m/s)', 'θ (°)', 'DIST (m)', 'RANGE (m)', 'RESULT'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left" style={{color:'#4a4a7a', borderBottom:'1px solid #2a2a4a', fontSize:'9px'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {log.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-4 text-center" style={{color:'#2a2a4a', fontSize:'9px'}}>
+                      NO ATTEMPTS YET
+                    </td>
+                  </tr>
+                ) : log.map(row => (
+                  <tr key={row.id} style={{borderBottom:'1px solid #1a1a2e'}}>
+                    <td className="px-3 py-2" style={{color:'#00aaff'}}>{row.vi}</td>
+                    <td className="px-3 py-2" style={{color:'#ff6600'}}>{row.angle}</td>
+                    <td className="px-3 py-2" style={{color:'#f0f0e8'}}>{row.dist}</td>
+                    <td className="px-3 py-2" style={{color:'#888'}}>{row.range.toFixed(1)}</td>
+                    <td className="px-3 py-2 font-bold" style={{color: row.result === 'COMPLETE' ? '#00ff41' : '#ff3131'}}>
+                      {row.result}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [vi, setVi] = useState(25);
+      const [angle, setAngle] = useState(45);
+      const [receiverDist, setReceiverDist] = useState(30);
+      const [completions, setCompletions] = useState(0);
+      const [attemptLog, setAttemptLog] = useState([]);
+      const [isAnimating, setIsAnimating] = useState(false);
+      const [currentVx, setCurrentVx] = useState(0);
+      const [currentVy, setCurrentVy] = useState(0);
+      const [showResult, setShowResult] = useState(null); // 'COMPLETE' | 'INCOMPLETE' | null
+
+      const canvasRef = useRef(null);
+      const animRef = useRef(null);
+      const trailRef = useRef([]);
+
+      const redrawStatic = useCallback((caught = false) => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+        drawField(ctx, receiverDist);
+        drawQB(ctx);
+        drawReceiver(ctx, receiverDist, caught);
+      }, [receiverDist]);
+
+      useEffect(() => { redrawStatic(); }, [redrawStatic]);
+
+      const handleRandomize = () => {
+        if (isAnimating) return;
+        setShowResult(null);
+        const newDist = Math.floor(Math.random() * 45) + 10; // 10–54 meters
+        setReceiverDist(newDist);
+      };
+
+      // Redraw when receiverDist changes even outside the effect chain
+      useEffect(() => {
+        if (!isAnimating) { redrawStatic(); setShowResult(null); }
+      }, [receiverDist, isAnimating, redrawStatic]);
+
+      const logAttempt = (viVal, angleVal, distVal, rangeVal, result) => {
+        setAttemptLog(prev => {
+          const entry = { id: Date.now(), vi: viVal, angle: angleVal, dist: distVal, range: rangeVal, result };
+          return [entry, ...prev].slice(0, 5);
+        });
+      };
+
+      const handleSimulate = () => {
+        if (isAnimating) return;
+        if (animRef.current) cancelAnimationFrame(animRef.current);
+        trailRef.current = [];
+        setShowResult(null);
+        setIsAnimating(true);
+
+        const viVal = vi;
+        const angleVal = angle;
+        const distVal = receiverDist;
+        const range = maxRange(viVal, angleVal);
+
+        // Pre-check: ball can't possibly reach
+        const a = toRad(angleVal);
+        const vx0 = viVal * Math.cos(a);
+        const vy0 = viVal * Math.sin(a);
+
+        // Check height at receiver's x position
+        const tAtReceiver = distVal / vx0;
+        const yAtReceiver = vy0 * tAtReceiver - 0.5 * G * tAtReceiver * tAtReceiver;
+
+        let startTime = null;
+
+        const animate = (timestamp) => {
+          if (!startTime) startTime = timestamp;
+          const elapsed = (timestamp - startTime) / 1000; // seconds
+
+          const { x, y, vx, vy } = ballPos(elapsed, viVal, angleVal);
+          const { cx, cy } = worldToCanvas(x, y);
+
+          setCurrentVx(vx);
+          setCurrentVy(vy);
+
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          const ctx = canvas.getContext('2d');
+
+          // Push to trail
+          trailRef.current.push({ cx, cy });
+          if (trailRef.current.length > 20) trailRef.current.shift();
+
+          // Redraw
+          ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+          drawField(ctx, distVal);
+          drawQB(ctx);
+          drawReceiver(ctx, distVal, false);
+          drawBall(ctx, trailRef.current, x, y);
+
+          // Check completion: x within ±1m of receiver AND y in catch zone
+          const caught = Math.abs(x - distVal) < 1.2 && y >= CATCH_MIN_Y && y <= CATCH_MAX_Y;
+
+          if (caught) {
+            ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+            drawField(ctx, distVal);
+            drawQB(ctx);
+            drawReceiver(ctx, distVal, true);
+            drawBall(ctx, trailRef.current, x, y);
+            drawResult(ctx, 'COMPLETE');
+            setShowResult('COMPLETE');
+            setCompletions(c => c + 1);
+            logAttempt(viVal, angleVal, distVal, range, 'COMPLETE');
+            setIsAnimating(false);
+            return;
+          }
+
+          // Ball hit the ground or flew past receiver
+          const missedLong = x > distVal + 1.5;
+          const hitGround = y < 0 && x > 0.5;
+
+          if (missedLong || hitGround) {
+            ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+            drawField(ctx, distVal);
+            drawQB(ctx);
+            drawReceiver(ctx, distVal, false);
+            drawBall(ctx, trailRef.current, x, Math.max(y, 0));
+            drawResult(ctx, 'INCOMPLETE');
+            setShowResult('INCOMPLETE');
+            logAttempt(viVal, angleVal, distVal, range, 'INCOMPLETE');
+            setIsAnimating(false);
+            return;
+          }
+
+          animRef.current = requestAnimationFrame(animate);
+        };
+
+        animRef.current = requestAnimationFrame(animate);
+      };
+
+      return (
+        <div className="min-h-screen py-4 px-2" style={{background:'#0d0d0d', fontFamily:'"Press Start 2P", monospace'}}>
+          <div className="max-w-3xl mx-auto space-y-4">
+            <Header />
+
+            {/* Canvas area */}
+            <div className="relative rounded-lg overflow-hidden" style={{border:'3px solid #2a2a4a'}}>
+              <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H} className="w-full block" />
+              <VelocityOverlay vx={currentVx} vy={currentVy} isAnimating={isAnimating} />
+              {/* Physics equations overlay */}
+              <div className="absolute bottom-2 left-2 font-pixel pointer-events-none" style={{fontSize:'7px', color:'rgba(255,255,255,0.25)'}}>
+                y = x·tan(θ) - gx²/2v²cos²(θ) &nbsp;|&nbsp; g = 9.8 m/s²
+              </div>
+            </div>
+
+            <Scoreboard completions={completions} />
+
+            <ControlPanel
+              vi={vi} setVi={setVi}
+              angle={angle} setAngle={setAngle}
+              onSimulate={handleSimulate}
+              onRandomize={handleRandomize}
+              isAnimating={isAnimating}
+            />
+
+            {/* Current physics preview */}
+            <div className="grid grid-cols-3 gap-2 font-pixel text-center" style={{fontSize:'9px'}}>
+              <div className="p-2 rounded" style={{background:'#0a0a1a', border:'1px solid #2a2a4a'}}>
+                <div style={{color:'#4a4a7a'}}>Vx</div>
+                <div style={{color:'#00aaff'}} className="mt-1">{(vi * Math.cos(toRad(angle))).toFixed(1)} m/s</div>
+              </div>
+              <div className="p-2 rounded" style={{background:'#0a0a1a', border:'1px solid #2a2a4a'}}>
+                <div style={{color:'#4a4a7a'}}>Vy₀</div>
+                <div style={{color:'#ff6600'}} className="mt-1">{(vi * Math.sin(toRad(angle))).toFixed(1)} m/s</div>
+              </div>
+              <div className="p-2 rounded" style={{background:'#0a0a1a', border:'1px solid #2a2a4a'}}>
+                <div style={{color:'#4a4a7a'}}>MAX RANGE</div>
+                <div style={{color:'#ffe600'}} className="mt-1">{maxRange(vi, angle).toFixed(1)} m</div>
+              </div>
+            </div>
+
+            <DataTable log={attemptLog} />
+
+            <div className="font-pixel text-center pb-4" style={{fontSize:'8px', color:'#2a2a4a'}}>
+              HIT WR ± 1.2m &nbsp;|&nbsp; CATCH ZONE: {CATCH_MIN_Y}m – {CATCH_MAX_Y}m HIGH
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
