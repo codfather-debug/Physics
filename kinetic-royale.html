@@ -412,12 +412,19 @@
           <div className="max-w-3xl mx-auto space-y-5">
 
             {/* Header */}
-            <div className="text-center">
-              <h1 className="text-3xl font-black tracking-tight bg-clip-text text-transparent"
-                  style={{backgroundImage:'linear-gradient(135deg, #38bdf8, #818cf8, #f472b6)'}}>
-                KINETIC ROYALE
-              </h1>
-              <p className="text-sm mt-1" style={{color:'#64748b'}}>Momentum &amp; Collision Lab</p>
+            <div className="flex items-center justify-between">
+              <a href="/index.html" className="text-xs px-3 py-2 rounded inline-block"
+                 style={{color:'#475569', border:'1px solid #334155', textDecoration:'none', fontFamily:'monospace', lineHeight:1}}>
+                ← MENU
+              </a>
+              <div className="text-center flex-1">
+                <h1 className="text-3xl font-black tracking-tight bg-clip-text text-transparent"
+                    style={{backgroundImage:'linear-gradient(135deg, #38bdf8, #818cf8, #f472b6)'}}>
+                  KINETIC ROYALE
+                </h1>
+                <p className="text-sm mt-1" style={{color:'#64748b'}}>Momentum &amp; Collision Lab</p>
+              </div>
+              <div style={{width:'80px'}} />
             </div>
 
             {/* Controls row */}
