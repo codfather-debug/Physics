@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Torque Titan</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { background: #0d0d0d; margin: 0; color: #e2e8f0; }
+    .pixel { font-family: 'Press Start 2P', monospace; }
+    canvas { display: block; cursor: default; }
+    canvas.dragging { cursor: ew-resize; }
+    canvas.can-place { cursor: crosshair; }
+
+    @keyframes pulse-green { 0%,100%{box-shadow:0 0 16px rgba(0,255,100,0.4)} 50%{box-shadow:0 0 40px rgba(0,255,100,0.9)} }
+    @keyframes shake { 0%,100%{transform:translateX(0)} 20%{transform:translateX(-6px)} 40%{transform:translateX(6px)} 60%{transform:translateX(-4px)} 80%{transform:translateX(4px)} }
+    @keyframes fall-tower { from{transform:translateY(0) rotate(0deg);opacity:1} to{transform:translateY(80px) rotate(35deg);opacity:0} }
+    @keyframes score-pop { 0%{transform:scale(0.5) translateY(0);opacity:0} 40%{transform:scale(1.4) translateY(-10px);opacity:1} 100%{transform:scale(1) translateY(-24px);opacity:0} }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    .success-glow { animation: pulse-green 0.8s ease-in-out infinite; }
+    .score-pop { animation: score-pop 1.2s ease-out forwards; }
+    .blink { animation: blink 1s step-end infinite; }
+
+    .level-btn { transition: all 0.1s; }
+    .level-btn:hover { transform: translateY(-2px); filter: brightness(1.2); }
+    .level-btn:active { transform: translateY(1px); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #111; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+    .torque-table th, .torque-table td {
+      font-family: 'Press Start 2P', monospace;
+      font-size: 8px;
+      padding: 6px 8px;
+      text-align: right;
+      border-bottom: 1px solid #1a1a2e;
+    }
+    .torque-table th { color: #888; text-align: right; }
+    .torque-table td:first-child, .torque-table th:first-child { text-align: left; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const CANVAS_W = 700;
+const CANVAS_H = 320;
+const BEAM_W = 600;
+const BEAM_H = 18;
+const FULCRUM_H = 40;
+const GROUND_Y = CANVAS_H - 30;
+const BEAM_Y = GROUND_Y - FULCRUM_H - BEAM_H / 2;   // center of beam
+const SCALE = 100; // px per meter
+const G = 9.8;
+const WEIGHT_SIZE = 32;
+const WEIGHT_GAP = 6; // below beam
+
+const COLORS = {
+  sky1: '#0a0a1a',
+  sky2: '#111128',
+  beam: '#8b7355',
+  beamDark: '#6b5535',
+  fulcrum: '#ffe600',
+  fulcrumGlow: '#ffff88',
+  ground: '#1a1a0a',
+  groundLine: '#3a3a1a',
+  red: '#cc2222',
+  blue: '#2244cc',
+  gold: '#ccaa00',
+  green: '#00e676',
+  cyan: '#00bcd4',
+  purple: '#9c27b0',
+  torqueCW: '#ff5252',
+  torqueCCW: '#69f0ae',
+};
+
+const WEIGHT_COLORS = ['#cc2222','#2244cc','#ccaa00','#9c27b0','#00bcd4','#e91e63'];
+
+// ─── Level Definitions ────────────────────────────────────────────────────────
+const LEVELS = [
+  {
+    id: 1,
+    title: 'BALANCE THE BEAM',
+    subtitle: 'Drag the fulcrum to balance!',
+    objective: 'Achieve |ΣΤ| < 5 N·m',
+    hint: 'τ = r × F  →  balance needs equal torques each side',
+    goalType: 'balance',
+    goalValue: 5,
+    moveFulcrum: true,
+    placeWeights: false,
+    weights: [
+      { id: 1, mass: 30, pos: -2.0, fixed: true, color: WEIGHT_COLORS[0], label: '30kg' },
+      { id: 2, mass: 20, pos: 1.5,  fixed: true, color: WEIGHT_COLORS[1], label: '20kg' },
+    ],
+    fulcrumStart: 350,
+    availableMasses: [],
+    description: [
+      'Two weights are fixed to the beam.',
+      'Drag the FULCRUM left or right.',
+      'Balance when ΣΤ ≈ 0 N·m.',
+    ],
+  },
+  {
+    id: 2,
+    title: 'LIFT THE LOAD',
+    subtitle: 'Place a counterweight!',
+    objective: 'Make ΣΤ < −20 N·m (tip LEFT)',
+    hint: 'Place heavy weight far left for maximum torque',
+    goalType: 'tip_left',
+    goalValue: -20,
+    moveFulcrum: false,
+    placeWeights: true,
+    placeSide: 'left',
+    maxPlacements: 1,
+    weights: [
+      { id: 1, mass: 50, pos: 3.0, fixed: true, color: WEIGHT_COLORS[2], label: '50kg' },
+    ],
+    fulcrumStart: 350,
+    availableMasses: [10, 20, 50],
+    description: [
+      'A 50 kg crate sits on the right.',
+      'Select a mass, then CLICK on the',
+      'left side of the beam to place it.',
+      'Tip beam LEFT: ΣΤ < -20 N·m.',
+    ],
+  },
+  {
+    id: 3,
+    title: 'PRECISION BALANCE',
+    subtitle: 'Tighter tolerance — be precise!',
+    objective: 'Achieve |ΣΤ| < 2 N·m',
+    hint: 'Three weights — find the exact fulcrum position',
+    goalType: 'balance',
+    goalValue: 2,
+    moveFulcrum: true,
+    placeWeights: false,
+    weights: [
+      { id: 1, mass: 40, pos: -2.5, fixed: true, color: WEIGHT_COLORS[0], label: '40kg' },
+      { id: 2, mass: 15, pos: -0.5, fixed: true, color: WEIGHT_COLORS[1], label: '15kg' },
+      { id: 3, mass: 25, pos: 2.0,  fixed: true, color: WEIGHT_COLORS[2], label: '25kg' },
+    ],
+    fulcrumStart: 350,
+    availableMasses: [],
+    description: [
+      'Three fixed weights on the beam.',
+      'Drag the FULCRUM for balance.',
+      'This time: |ΣΤ| must be < 2 N·m.',
+      'Hint: find the center of mass!',
+    ],
+  },
+  {
+    id: 4,
+    title: 'THE WRECKING BALL',
+    subtitle: 'Place your weights strategically!',
+    objective: 'Achieve |ΣΤ| < 10 N·m',
+    hint: 'Spread weights to maximize combined torque',
+    goalType: 'balance',
+    goalValue: 10,
+    moveFulcrum: false,
+    placeWeights: true,
+    placeSide: 'left',
+    maxPlacements: 3,
+    weights: [
+      { id: 1, mass: 100, pos: 2.8, fixed: true, color: WEIGHT_COLORS[0], label: '100kg' },
+    ],
+    fulcrumStart: 350,
+    availableMasses: [10, 10, 20],
+    description: [
+      'A 100 kg wrecking ball on the right.',
+      'You have: 10 kg, 10 kg, 20 kg.',
+      'Place all 3 on the LEFT side.',
+      'Balance within 10 N·m to win!',
+    ],
+  },
+  {
+    id: 5,
+    title: 'TOWER TOPPLER',
+    subtitle: 'Unleash maximum torque!',
+    objective: 'Achieve ΣΤ > 200 N·m (tip RIGHT is wrong — tip LEFT!)',
+    hint: 'Place massive weights as far left as possible',
+    goalType: 'tip_left_hard',
+    goalValue: -200,
+    moveFulcrum: false,
+    placeWeights: true,
+    placeSide: 'left',
+    maxPlacements: 3,
+    weights: [
+      { id: 1, mass: 5,  pos: 2.2,  fixed: true, color: WEIGHT_COLORS[5], label: '5kg',  isTower: true },
+      { id: 2, mass: 5,  pos: 2.5,  fixed: true, color: WEIGHT_COLORS[5], label: '5kg',  isTower: true },
+      { id: 3, mass: 5,  pos: 2.8,  fixed: true, color: WEIGHT_COLORS[5], label: '5kg',  isTower: true },
+    ],
+    fulcrumStart: 350,
+    availableMasses: [50, 80, 100],
+    description: [
+      'A tower stands on the right side!',
+      'Place 3 massive weights on the LEFT.',
+      'Smash it with ΣΤ < -200 N·m!',
+      'Choose wisely — place them FAR left.',
+    ],
+    towerRight: true,
+  },
+];
+
+// ─── Physics Helpers ──────────────────────────────────────────────────────────
+function calcNetTorque(weights, fulcrumX) {
+  // fulcrumX is canvas pixels; weights have pos in meters from original center (350)
+  // Effective r = pos (meters) - (fulcrumX - 350)/100  (meters)
+  const fulcrumOffset = (fulcrumX - 350) / SCALE; // meters from center
+  let net = 0;
+  for (const w of weights) {
+    const r = w.pos - fulcrumOffset; // meters from current fulcrum
+    const torque = r * w.mass * G;   // τ = r·F (positive = CCW = tips left)
+    net += torque;
+  }
+  return net; // negative means tips right (CW), positive means tips left (CCW)
+}
+
+function calcCOM(weights) {
+  // Returns center of mass in meters (from beam center = 350px)
+  let totalMass = 0, weightedSum = 0;
+  for (const w of weights) {
+    totalMass += w.mass;
+    weightedSum += w.mass * w.pos;
+  }
+  return totalMass === 0 ? 0 : weightedSum / totalMass;
+}
+
+function beamAngle(netTorque) {
+  // positive netTorque → tips left (negative angle from horizontal)
+  const deg = Math.max(-30, Math.min(30, netTorque / 600));
+  return -deg * Math.PI / 180; // canvas rotation: positive = clockwise
+}
+
+// ─── Drawing Helpers ─────────────────────────────────────────────────────────
+function drawSky(ctx) {
+  const grad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+  grad.addColorStop(0, '#0a0a1a');
+  grad.addColorStop(1, '#111128');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+}
+
+function drawGround(ctx) {
+  ctx.fillStyle = '#1a1a0a';
+  ctx.fillRect(0, GROUND_Y, CANVAS_W, CANVAS_H - GROUND_Y);
+  ctx.strokeStyle = '#3a4a1a';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y);
+  ctx.lineTo(CANVAS_W, GROUND_Y);
+  ctx.stroke();
+  // grid marks
+  ctx.strokeStyle = '#1e2a0a';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < CANVAS_W; x += 50) {
+    ctx.beginPath();
+    ctx.moveTo(x, GROUND_Y);
+    ctx.lineTo(x, CANVAS_H);
+    ctx.stroke();
+  }
+}
+
+function drawFulcrum(ctx, fx, balanced, flashAlpha) {
+  const base = 36;
+  const fy = GROUND_Y;
+  const tip = fy - FULCRUM_H;
+
+  // Glow when balanced
+  if (balanced || flashAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = balanced ? 0.6 : flashAlpha;
+    ctx.shadowBlur = 30;
+    ctx.shadowColor = '#00ff64';
+    ctx.beginPath();
+    ctx.moveTo(fx, tip - 4);
+    ctx.lineTo(fx - base / 2 - 4, fy + 4);
+    ctx.lineTo(fx + base / 2 + 4, fy + 4);
+    ctx.closePath();
+    ctx.fillStyle = '#00ff64';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Shadow
+  ctx.save();
+  ctx.globalAlpha = 0.3;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(fx, fy + 2, base / 2, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Triangle body
+  ctx.beginPath();
+  ctx.moveTo(fx, tip);
+  ctx.lineTo(fx - base / 2, fy);
+  ctx.lineTo(fx + base / 2, fy);
+  ctx.closePath();
+  const fGrad = ctx.createLinearGradient(fx - base / 2, tip, fx + base / 2, fy);
+  fGrad.addColorStop(0, '#ffe600');
+  fGrad.addColorStop(1, '#cc9900');
+  ctx.fillStyle = fGrad;
+  ctx.fill();
+  ctx.strokeStyle = '#fff176';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Pivot dot
+  ctx.beginPath();
+  ctx.arc(fx, tip, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff9c4';
+  ctx.fill();
+}
+
+function drawBeam(ctx, fx, angle, flashAlpha) {
+  ctx.save();
+  ctx.translate(fx, BEAM_Y);
+  ctx.rotate(angle);
+
+  const halfW = BEAM_W / 2;
+
+  // Beam shadow
+  ctx.globalAlpha = 0.2;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(-halfW + 4, -BEAM_H / 2 + 4, BEAM_W, BEAM_H);
+  ctx.globalAlpha = 1;
+
+  // Beam body gradient
+  const bGrad = ctx.createLinearGradient(0, -BEAM_H / 2, 0, BEAM_H / 2);
+  bGrad.addColorStop(0, '#a08060');
+  bGrad.addColorStop(0.5, '#8b7355');
+  bGrad.addColorStop(1, '#5a4030');
+  ctx.fillStyle = bGrad;
+  ctx.fillRect(-halfW, -BEAM_H / 2, BEAM_W, BEAM_H);
+
+  // Wood grain lines
+  ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+  ctx.lineWidth = 1;
+  for (let x = -halfW + 20; x < halfW; x += 40) {
+    ctx.beginPath();
+    ctx.moveTo(x, -BEAM_H / 2);
+    ctx.lineTo(x + 5, BEAM_H / 2);
+    ctx.stroke();
+  }
+
+  // Beam outline
+  ctx.strokeStyle = '#c0a070';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(-halfW, -BEAM_H / 2, BEAM_W, BEAM_H);
+
+  // Flash overlay
+  if (flashAlpha > 0) {
+    ctx.globalAlpha = flashAlpha * 0.6;
+    ctx.fillStyle = '#00ff64';
+    ctx.fillRect(-halfW, -BEAM_H / 2, BEAM_W, BEAM_H);
+    ctx.globalAlpha = 1;
+  }
+
+  // Scale marks (meter marks relative to beam center, which shifts with fulcrum)
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.font = '6px Press Start 2P, monospace';
+  ctx.textAlign = 'center';
+  for (let m = -3; m <= 3; m++) {
+    const px = m * SCALE;
+    if (Math.abs(px) > halfW) continue;
+    ctx.beginPath();
+    ctx.moveTo(px, -BEAM_H / 2);
+    ctx.lineTo(px, BEAM_H / 2);
+    ctx.stroke();
+    if (m !== 0) {
+      ctx.fillText(m > 0 ? `+${m}` : `${m}`, px, -BEAM_H / 2 - 3);
+    }
+  }
+
+  ctx.restore();
+}
+
+function getWeightColor(idx) {
+  return WEIGHT_COLORS[idx % WEIGHT_COLORS.length];
+}
+
+function drawWeights(ctx, weights, fx, angle, towerFall) {
+  ctx.save();
+  ctx.translate(fx, BEAM_Y);
+  ctx.rotate(angle);
+
+  weights.forEach((w, idx) => {
+    const px = w.pos * SCALE; // pixels from beam center (= fulcrum at start)
+    const py = BEAM_H / 2 + WEIGHT_GAP;
+
+    const ww = WEIGHT_SIZE + (w.mass >= 100 ? 8 : w.mass >= 50 ? 4 : 0);
+    const wh = WEIGHT_SIZE + (w.mass >= 100 ? 8 : w.mass >= 50 ? 4 : 0);
+
+    // Tower blocks stacked
+    if (w.isTower) {
+      const stackIdx = weights.filter((x, i) => x.isTower && i <= idx).length - 1;
+      const blockH = 22;
+      const blockW = 28;
+      const stackY = py + stackIdx * blockH;
+
+      if (towerFall > 0) {
+        ctx.save();
+        ctx.translate(px + blockW / 2, stackY + blockH / 2);
+        ctx.rotate(towerFall * 0.6);
+        ctx.globalAlpha = Math.max(0, 1 - towerFall);
+        ctx.translate(-blockW / 2, -blockH / 2);
+        drawBlock(ctx, 0, 0, blockW, blockH, w.color, stackIdx);
+        ctx.restore();
+      } else {
+        drawBlock(ctx, px, stackY, blockW, blockH, w.color, stackIdx);
+      }
+      return;
+    }
+
+    // Regular weight box
+    ctx.save();
+
+    // Drop shadow
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(px - ww / 2 + 3, py + 3, ww, wh);
+    ctx.globalAlpha = 1;
+
+    // Weight body
+    const wGrad = ctx.createLinearGradient(px - ww / 2, py, px + ww / 2, py + wh);
+    wGrad.addColorStop(0, lighten(w.color, 40));
+    wGrad.addColorStop(1, darken(w.color, 30));
+    ctx.fillStyle = wGrad;
+    ctx.fillRect(px - ww / 2, py, ww, wh);
+
+    // Border
+    ctx.strokeStyle = lighten(w.color, 60);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(px - ww / 2, py, ww, wh);
+
+    // Hanging rod
+    ctx.strokeStyle = '#888';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, py);
+    ctx.stroke();
+
+    // Mass label
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${w.mass >= 100 ? 6 : 7}px Press Start 2P, monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(w.label || `${w.mass}kg`, px, py + wh / 2);
+
+    ctx.restore();
+  });
+
+  ctx.restore();
+}
+
+function drawBlock(ctx, x, y, w, h, color, idx) {
+  const grad = ctx.createLinearGradient(x, y, x, y + h);
+  grad.addColorStop(0, lighten(color, 30));
+  grad.addColorStop(1, darken(color, 20));
+  ctx.fillStyle = grad;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = lighten(color, 50);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, w, h);
+  // Brick texture
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(x + 2, y + h / 2 - 1, w - 4, 2);
+  if (idx % 2 === 0) {
+    ctx.fillRect(x + w / 2 - 1, y + 2, 2, h / 2 - 3);
+  } else {
+    ctx.fillRect(x + 2, y + 2, 2, h / 2 - 3);
+    ctx.fillRect(x + w - 4, y + 2, 2, h / 2 - 3);
+  }
+}
+
+function drawTorqueArrows(ctx, weights, fx, angle) {
+  ctx.save();
+  ctx.translate(fx, BEAM_Y);
+  ctx.rotate(angle);
+
+  weights.forEach(w => {
+    if (w.isTower) return;
+    const px = w.pos * SCALE;
+    const torque = w.pos * w.mass * G; // relative to beam center for arrow dir
+    const isCCW = torque > 0; // positive r·F = CCW = tips left
+
+    const color = isCCW ? COLORS.torqueCCW : COLORS.torqueCW;
+    const arrowY = -BEAM_H / 2 - 8;
+
+    // Dashed r-line
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, arrowY - 5);
+    ctx.lineTo(px, arrowY - 5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // r label
+    const rAbs = Math.abs(w.pos);
+    if (rAbs > 0.15) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '6px Press Start 2P, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`r=${rAbs.toFixed(1)}m`, px / 2, arrowY - 10);
+    }
+
+    // Torque magnitude arc arrow
+    const mag = Math.abs(torque);
+    const arcLen = Math.min(60, mag / 60);
+    const arcR = 18;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.arc(px, 0, arcR, isCCW ? 0.3 : Math.PI - 0.3, isCCW ? Math.PI * 1.7 - 0.3 : Math.PI * 2 - 0.3, !isCCW);
+    ctx.stroke();
+
+    // Arrow head
+    const aAngle = isCCW ? Math.PI * 1.7 - 0.3 : -0.3;
+    const ax = px + arcR * Math.cos(aAngle);
+    const ay = arcR * Math.sin(aAngle);
+    const headDir = isCCW ? 1 : -1;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(ax - headDir * 6, ay - 4);
+    ctx.lineTo(ax - headDir * 6, ay + 4);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+  });
+
+  ctx.restore();
+}
+
+function drawNetTorqueHUD(ctx, netTorque, goalMet) {
+  const x = 10, y = 10;
+  const abs = Math.abs(netTorque);
+  const color = goalMet ? '#00e676' : abs > 200 ? '#ff5252' : '#ffd740';
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.roundRect(x, y, 190, 44, 6);
+  ctx.fill();
+
+  ctx.font = '7px Press Start 2P, monospace';
+  ctx.fillStyle = '#aaa';
+  ctx.textAlign = 'left';
+  ctx.fillText('NET TORQUE', x + 8, y + 14);
+
+  ctx.font = 'bold 11px Press Start 2P, monospace';
+  ctx.fillStyle = color;
+  if (goalMet) {
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = '#00e676';
+  }
+  ctx.fillText(`ΣΤ = ${netTorque.toFixed(1)} N·m`, x + 8, y + 34);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawFulcrumPos(ctx, fx) {
+  const mFromCenter = ((fx - 350) / SCALE).toFixed(2);
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.roundRect(CANVAS_W - 150, 10, 140, 44, 6);
+  ctx.fill();
+  ctx.font = '7px Press Start 2P, monospace';
+  ctx.fillStyle = '#aaa';
+  ctx.textAlign = 'left';
+  ctx.fillText('FULCRUM POS', CANVAS_W - 142, 24);
+  ctx.font = 'bold 10px Press Start 2P, monospace';
+  ctx.fillStyle = '#ffe600';
+  ctx.fillText(`x = ${mFromCenter} m`, CANVAS_W - 142, 44);
+  ctx.restore();
+}
+
+// Color helpers
+function lighten(hex, amt) {
+  const n = parseInt(hex.replace('#',''), 16);
+  const r = Math.min(255, (n >> 16) + amt);
+  const g = Math.min(255, ((n >> 8) & 0xff) + amt);
+  const b = Math.min(255, (n & 0xff) + amt);
+  return `rgb(${r},${g},${b})`;
+}
+function darken(hex, amt) {
+  const n = parseInt(hex.replace('#',''), 16);
+  const r = Math.max(0, (n >> 16) - amt);
+  const g = Math.max(0, ((n >> 8) & 0xff) - amt);
+  const b = Math.max(0, (n & 0xff) - amt);
+  return `rgb(${r},${g},${b})`;
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+export default function App() {
+  return <TorqueTitan />;
+}
+
+function TorqueTitan() {
+  const [levelIdx, setLevelIdx] = useState(0);
+  const level = LEVELS[levelIdx];
+
+  // Fulcrum position in canvas pixels
+  const [fulcrumX, setFulcrumX] = useState(level.fulcrumStart);
+  // Placed weights (user-added)
+  const [placedWeights, setPlacedWeights] = useState([]);
+  // Selected mass for placement
+  const [selectedMass, setSelectedMass] = useState(level.availableMasses[0] || null);
+  // Remaining masses to place
+  const [remainingMasses, setRemainingMasses] = useState([...level.availableMasses]);
+  // Game phase
+  const [phase, setPhase] = useState('playing'); // playing | success | complete
+  // Score
+  const [score, setScore] = useState(0);
+  // Flash animation state
+  const [flashAlpha, setFlashAlpha] = useState(0);
+  // Tower fall animation
+  const [towerFall, setTowerFall] = useState(0);
+  // Score pop
+  const [showScorePop, setShowScorePop] = useState(false);
+  // Dragging fulcrum
+  const draggingRef = useRef(false);
+  const dragStartRef = useRef({ x: 0, fx: 0 });
+
+  const canvasRef = useRef(null);
+  const animRef = useRef(null);
+  const flashRef = useRef(0);
+  const towerFallRef = useRef(0);
+
+  // Combine fixed + placed weights
+  const allWeights = useMemo(() => {
+    const fixed = level.weights.map(w => ({ ...w }));
+    const placed = placedWeights.map((w, i) => ({
+      ...w,
+      id: 1000 + i,
+      color: WEIGHT_COLORS[(2 + i) % WEIGHT_COLORS.length],
+    }));
+    return [...fixed, ...placed];
+  }, [level, placedWeights]);
+
+  const netTorque = useMemo(() => calcNetTorque(allWeights, fulcrumX), [allWeights, fulcrumX]);
+  const angle = useMemo(() => beamAngle(netTorque), [netTorque]);
+
+  const goalMet = useMemo(() => {
+    if (phase === 'success') return true;
+    const { goalType, goalValue } = level;
+    if (goalType === 'balance')     return Math.abs(netTorque) < goalValue;
+    if (goalType === 'tip_left')    return netTorque > Math.abs(goalValue);
+    if (goalType === 'tip_left_hard') return netTorque > Math.abs(goalValue);
+    return false;
+  }, [netTorque, level, phase]);
+
+  // Reset on level change
+  useEffect(() => {
+    setFulcrumX(level.fulcrumStart);
+    setPlacedWeights([]);
+    setSelectedMass(level.availableMasses[0] || null);
+    setRemainingMasses([...level.availableMasses]);
+    setPhase('playing');
+    setFlashAlpha(0);
+    setTowerFall(0);
+    flashRef.current = 0;
+    towerFallRef.current = 0;
+  }, [levelIdx]);
+
+  // Success detection
+  useEffect(() => {
+    if (goalMet && phase === 'playing') {
+      if (level.towerRight) {
+        // Trigger tower fall
+        towerFallRef.current = 0.01;
+      } else {
+        flashRef.current = 1.0;
+        setShowScorePop(true);
+        setTimeout(() => setShowScorePop(false), 1400);
+      }
+      setScore(s => s + 100);
+      setTimeout(() => setPhase('success'), level.towerRight ? 1200 : 600);
+    }
+  }, [goalMet, phase]);
+
+  // Canvas render loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    let running = true;
+    function frame() {
+      if (!running) return;
+
+      // Update flash
+      if (flashRef.current > 0) {
+        flashRef.current = Math.max(0, flashRef.current - 0.025);
+        setFlashAlpha(flashRef.current);
+      }
+      // Update tower fall
+      if (towerFallRef.current > 0 && towerFallRef.current < 1) {
+        towerFallRef.current = Math.min(1, towerFallRef.current + 0.018);
+        setTowerFall(towerFallRef.current);
+      }
+
+      // Clear & draw
+      drawSky(ctx);
+      drawGround(ctx);
+
+      const currentAngle = beamAngle(calcNetTorque(allWeights, fulcrumX));
+
+      drawTorqueArrows(ctx, allWeights, fulcrumX, currentAngle);
+      drawBeam(ctx, fulcrumX, currentAngle, flashRef.current);
+      drawWeights(ctx, allWeights, fulcrumX, currentAngle, towerFallRef.current);
+      drawFulcrum(ctx, fulcrumX, goalMet, flashRef.current);
+
+      const nt = calcNetTorque(allWeights, fulcrumX);
+      const gm = checkGoal(level, nt, phase);
+      drawNetTorqueHUD(ctx, nt, gm);
+      if (level.moveFulcrum) drawFulcrumPos(ctx, fulcrumX);
+
+      animRef.current = requestAnimationFrame(frame);
+    }
+
+    animRef.current = requestAnimationFrame(frame);
+    return () => {
+      running = false;
+      cancelAnimationFrame(animRef.current);
+    };
+  }, [allWeights, fulcrumX, level, goalMet, phase]);
+
+  function checkGoal(lvl, nt, ph) {
+    if (ph === 'success') return true;
+    if (lvl.goalType === 'balance')       return Math.abs(nt) < lvl.goalValue;
+    if (lvl.goalType === 'tip_left')      return nt > Math.abs(lvl.goalValue);
+    if (lvl.goalType === 'tip_left_hard') return nt > Math.abs(lvl.goalValue);
+    return false;
+  }
+
+  // ── Mouse handlers ──────────────────────────────────────────────────────
+  function getFulcrumRegion(mx, my) {
+    // Fulcrum triangle bounding box
+    return (
+      mx >= fulcrumX - 20 &&
+      mx <= fulcrumX + 20 &&
+      my >= GROUND_Y - FULCRUM_H - 4 &&
+      my <= GROUND_Y + 4
+    );
+  }
+
+  function getBeamRegion(mx, my) {
+    // Rough beam hit region (ignoring rotation for click)
+    return (
+      mx >= fulcrumX - BEAM_W / 2 - 10 &&
+      mx <= fulcrumX + BEAM_W / 2 + 10 &&
+      my >= BEAM_Y - 30 &&
+      my <= BEAM_Y + 60
+    );
+  }
+
+  function handleMouseDown(e) {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = CANVAS_W / rect.width;
+    const scaleY = CANVAS_H / rect.height;
+    const mx = (e.clientX - rect.left) * scaleX;
+    const my = (e.clientY - rect.top) * scaleY;
+
+    if (level.moveFulcrum && getFulcrumRegion(mx, my)) {
+      draggingRef.current = true;
+      dragStartRef.current = { x: mx, fx: fulcrumX };
+      canvasRef.current.classList.add('dragging');
+    }
+  }
+
+  function handleMouseMove(e) {
+    if (!draggingRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = CANVAS_W / rect.width;
+    const mx = (e.clientX - rect.left) * scaleX;
+    const delta = mx - dragStartRef.current.x;
+    const newFx = Math.max(100, Math.min(600, dragStartRef.current.fx + delta));
+    setFulcrumX(newFx);
+  }
+
+  function handleMouseUp(e) {
+    if (draggingRef.current) {
+      draggingRef.current = false;
+      canvasRef.current.classList.remove('dragging');
+    }
+  }
+
+  function handleCanvasClick(e) {
+    if (!level.placeWeights) return;
+    if (phase === 'success') return;
+    if (!selectedMass) return;
+    if (remainingMasses.length === 0) return;
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = CANVAS_W / rect.width;
+    const mx = (e.clientX - rect.left) * scaleX;
+
+    // Convert canvas x → position in meters from beam center
+    const posM = (mx - 350) / SCALE;
+
+    // Check side restriction
+    if (level.placeSide === 'left' && posM >= -0.2) return;
+
+    // Check beam range
+    if (posM < -3.1 || posM > 3.1) return;
+
+    // Remove one instance of selectedMass from remaining
+    const idx = remainingMasses.indexOf(selectedMass);
+    if (idx === -1) return;
+
+    const newRemaining = [...remainingMasses];
+    newRemaining.splice(idx, 1);
+    setRemainingMasses(newRemaining);
+
+    setPlacedWeights(pw => [
+      ...pw,
+      { mass: selectedMass, pos: posM, fixed: false, label: `${selectedMass}kg` },
+    ]);
+
+    // Auto-select next available mass
+    if (newRemaining.length > 0) {
+      setSelectedMass(newRemaining[0]);
+    } else {
+      setSelectedMass(null);
+    }
+  }
+
+  function handleReset() {
+    setFulcrumX(level.fulcrumStart);
+    setPlacedWeights([]);
+    setSelectedMass(level.availableMasses[0] || null);
+    setRemainingMasses([...level.availableMasses]);
+    setPhase('playing');
+    flashRef.current = 0;
+    towerFallRef.current = 0;
+    setTowerFall(0);
+  }
+
+  function handleNextLevel() {
+    if (levelIdx < LEVELS.length - 1) {
+      setLevelIdx(i => i + 1);
+    } else {
+      setPhase('complete');
+    }
+  }
+
+  // Torque table rows
+  const torqueRows = useMemo(() => {
+    const fulcrumOffset = (fulcrumX - 350) / SCALE;
+    return allWeights
+      .filter(w => !w.isTower)
+      .map(w => {
+        const r = w.pos - fulcrumOffset;
+        const F = w.mass * G;
+        const tau = r * F;
+        return { label: w.label || `${w.mass}kg`, r, F, tau, color: w.color };
+      });
+  }, [allWeights, fulcrumX]);
+
+  const canvasCursor = level.placeWeights && phase !== 'success' && remainingMasses.length > 0
+    ? 'can-place' : '';
+
+  if (phase === 'complete') {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: '#0d0d0d' }}>
+        <div className="text-center space-y-6 p-8">
+          <div className="pixel text-2xl" style={{ color: '#ffe600', textShadow: '0 0 30px #ffe600', lineHeight: 2 }}>
+            TORQUE TITAN<br/>COMPLETE!
+          </div>
+          <div className="pixel text-lg" style={{ color: '#00e676' }}>FINAL SCORE: {score}</div>
+          <div className="pixel text-xs" style={{ color: '#888', lineHeight: 2 }}>
+            You mastered:<br/>
+            Torque · Levers · Rotational Equilibrium
+          </div>
+          <a href="index.html">
+            <button className="pixel level-btn mt-4 px-8 py-3 text-xs"
+              style={{ background: '#1a3a1a', border: '2px solid #00e676', color: '#00e676', borderRadius: 6 }}>
+              ← BACK TO MENU
+            </button>
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen pb-12" style={{ background: '#0d0d0d' }}>
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3"
+           style={{ borderBottom: '2px solid #1a1a2e', background: '#080810' }}>
+        <a href="index.html" className="pixel text-xs" style={{ color: '#4a6a8a', textDecoration: 'none' }}>
+          ← MENU
+        </a>
+        <div className="pixel text-sm" style={{ color: '#ffe600', textShadow: '0 0 16px #ffe600' }}>
+          TORQUE TITAN
+        </div>
+        <div className="pixel text-xs" style={{ color: '#ffe600' }}>
+          {score} PTS
+        </div>
+      </div>
+
+      {/* Level bar */}
+      <div className="flex items-center justify-center gap-2 py-3 px-4"
+           style={{ background: '#0a0a16', borderBottom: '1px solid #1a1a2e' }}>
+        {LEVELS.map((l, i) => (
+          <div key={l.id}
+            className="pixel text-center"
+            style={{
+              width: 28, height: 28,
+              lineHeight: '28px',
+              fontSize: 9,
+              borderRadius: 4,
+              background: i < levelIdx ? '#1a3a1a' : i === levelIdx ? '#2a3a00' : '#111',
+              border: `2px solid ${i < levelIdx ? '#00e676' : i === levelIdx ? '#ffe600' : '#333'}`,
+              color: i < levelIdx ? '#00e676' : i === levelIdx ? '#ffe600' : '#555',
+            }}>
+            {i < levelIdx ? '✓' : l.id}
+          </div>
+        ))}
+        <div className="pixel text-xs ml-2" style={{ color: '#888' }}>
+          LVL {level.id}/5
+        </div>
+      </div>
+
+      {/* Main layout */}
+      <div className="max-w-4xl mx-auto px-4 pt-4 space-y-4">
+
+        {/* Level title */}
+        <div className="text-center space-y-1">
+          <div className="pixel text-xs" style={{ color: '#4a4a7a' }}>LEVEL {level.id}</div>
+          <div className="pixel text-base" style={{ color: '#ffe600', textShadow: '0 0 12px #ffe600', lineHeight: 1.8 }}>
+            {level.title}
+          </div>
+          <div className="pixel text-xs" style={{ color: '#888' }}>{level.subtitle}</div>
+        </div>
+
+        {/* Canvas */}
+        <div className="relative" style={{ maxWidth: CANVAS_W, margin: '0 auto' }}>
+          <canvas
+            ref={canvasRef}
+            width={CANVAS_W}
+            height={CANVAS_H}
+            className={`rounded-lg ${canvasCursor}`}
+            style={{
+              width: '100%',
+              border: `2px solid ${phase === 'success' ? '#00e676' : '#1a1a2e'}`,
+              boxShadow: phase === 'success' ? '0 0 30px rgba(0,230,118,0.4)' : '0 0 20px rgba(0,0,0,0.8)',
+              transition: 'border-color 0.3s, box-shadow 0.3s',
+            }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseUp}
+            onClick={handleCanvasClick}
+          />
+
+          {/* Score pop overlay */}
+          {showScorePop && (
+            <div className="score-pop pixel absolute text-xl"
+              style={{
+                top: '30%', left: '50%', transform: 'translateX(-50%)',
+                color: '#ffe600', textShadow: '0 0 20px #ffe600',
+                pointerEvents: 'none', zIndex: 10,
+              }}>
+              +100!
+            </div>
+          )}
+
+          {/* Success overlay */}
+          {phase === 'success' && (
+            <div className="pixel absolute inset-0 flex items-center justify-center"
+              style={{
+                background: 'rgba(0,0,0,0.55)',
+                borderRadius: 6,
+                fontSize: 14,
+                color: '#00e676',
+                textShadow: '0 0 24px #00e676',
+                lineHeight: 2,
+                textAlign: 'center',
+              }}>
+              {level.towerRight ? '💥 TOWER TOPPLED!' : '⚖ BALANCED!'}<br/>
+              <span style={{ fontSize: 9, color: '#aaa' }}>GOAL ACHIEVED</span>
+            </div>
+          )}
+        </div>
+
+        {/* Controls row */}
+        <div className="flex flex-wrap items-start gap-4 justify-between" style={{ maxWidth: CANVAS_W, margin: '0 auto' }}>
+
+          {/* Left: instructions */}
+          <div style={{
+            background: '#0a0a18',
+            border: '1px solid #1a1a3a',
+            borderRadius: 8,
+            padding: '12px 14px',
+            minWidth: 200,
+            flex: 1,
+          }}>
+            <div className="pixel text-xs mb-2" style={{ color: '#4a6a9a' }}>INSTRUCTIONS</div>
+            {level.description.map((d, i) => (
+              <div key={i} className="pixel" style={{ color: '#ccc', fontSize: 8, lineHeight: 1.9 }}>
+                {d}
+              </div>
+            ))}
+            <div className="pixel mt-3" style={{ color: '#ffe600', fontSize: 8, lineHeight: 1.8 }}>
+              GOAL: {level.objective}
+            </div>
+            <div className="pixel mt-1" style={{ color: '#4a6a4a', fontSize: 7, lineHeight: 1.8 }}>
+              HINT: {level.hint}
+            </div>
+          </div>
+
+          {/* Right: weight selector or fulcrum info */}
+          <div style={{ minWidth: 180 }}>
+            {level.placeWeights && (
+              <div style={{
+                background: '#0a0a18',
+                border: '1px solid #1a1a3a',
+                borderRadius: 8,
+                padding: '12px 14px',
+              }}>
+                <div className="pixel text-xs mb-2" style={{ color: '#4a6a9a' }}>PLACE WEIGHT</div>
+                <div className="pixel mb-2" style={{ color: '#888', fontSize: 7 }}>
+                  Remaining: [{remainingMasses.join(', ')}] kg
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {level.availableMasses
+                    .filter((m, i, arr) => arr.indexOf(m) === i) // unique
+                    .map(m => {
+                      const count = remainingMasses.filter(x => x === m).length;
+                      const isSelected = selectedMass === m && count > 0;
+                      return (
+                        <button key={m}
+                          className="level-btn pixel text-xs px-3 py-2"
+                          disabled={count === 0}
+                          style={{
+                            borderRadius: 4,
+                            border: `2px solid ${isSelected ? '#ffe600' : count > 0 ? '#4a4a6a' : '#2a2a2a'}`,
+                            background: isSelected ? '#2a2a00' : count > 0 ? '#111' : '#0a0a0a',
+                            color: isSelected ? '#ffe600' : count > 0 ? '#aaa' : '#333',
+                            opacity: count === 0 ? 0.4 : 1,
+                            cursor: count === 0 ? 'not-allowed' : 'pointer',
+                            fontSize: 8,
+                          }}
+                          onClick={() => count > 0 && setSelectedMass(m)}>
+                          {m}kg {count > 0 ? `(×${count})` : '✗'}
+                        </button>
+                      );
+                    })}
+                </div>
+                {remainingMasses.length === 0 && (
+                  <div className="pixel mt-2" style={{ color: '#ff7043', fontSize: 7 }}>
+                    All weights placed!
+                  </div>
+                )}
+                {remainingMasses.length > 0 && selectedMass && (
+                  <div className="pixel mt-2 blink" style={{ color: '#ffe600', fontSize: 7 }}>
+                    ▶ Click LEFT beam to place
+                  </div>
+                )}
+              </div>
+            )}
+
+            {level.moveFulcrum && (
+              <div style={{
+                background: '#0a0a18',
+                border: '1px solid #1a1a3a',
+                borderRadius: 8,
+                padding: '12px 14px',
+              }}>
+                <div className="pixel text-xs mb-2" style={{ color: '#4a6a9a' }}>FULCRUM CONTROL</div>
+                <div className="pixel mb-2" style={{ color: '#888', fontSize: 7 }}>
+                  Drag the yellow triangle<br/>to move the fulcrum.
+                </div>
+                <div className="pixel" style={{ color: '#ffe600', fontSize: 8 }}>
+                  Pos: {((fulcrumX - 350) / SCALE).toFixed(2)} m
+                </div>
+                {/* Slider fallback */}
+                <input type="range" min={80} max={620} value={fulcrumX}
+                  onChange={e => setFulcrumX(Number(e.target.value))}
+                  style={{ marginTop: 8, width: '100%', accentColor: '#ffe600' }} />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Physics equation banner */}
+        <div className="flex items-center justify-center gap-6 py-3 px-4 rounded-lg"
+          style={{
+            maxWidth: CANVAS_W, margin: '0 auto',
+            background: '#080810',
+            border: '1px solid #1a1a2e',
+          }}>
+          <span className="pixel text-xs" style={{ color: '#4a8a4a' }}>τ = r · F · sin(θ)</span>
+          <span className="pixel text-xs" style={{ color: '#4a4a8a' }}>τ = r · m · g</span>
+          <span className="pixel text-xs" style={{ color: '#8a4a4a' }}>ΣΤ = 0 → equilibrium</span>
+        </div>
+
+        {/* Torque table */}
+        <div style={{
+          maxWidth: CANVAS_W, margin: '0 auto',
+          background: '#080810',
+          border: '1px solid #1a1a2e',
+          borderRadius: 8,
+          overflow: 'hidden',
+        }}>
+          <div className="pixel px-4 py-2" style={{ color: '#4a6a9a', fontSize: 9, borderBottom: '1px solid #1a1a2e' }}>
+            LIVE TORQUE BREAKDOWN
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table className="torque-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  <th>WEIGHT</th>
+                  <th>r (m)</th>
+                  <th>F = mg (N)</th>
+                  <th>τ = r·F (N·m)</th>
+                  <th>DIRECTION</th>
+                </tr>
+              </thead>
+              <tbody>
+                {torqueRows.map((row, i) => (
+                  <tr key={i}>
+                    <td>
+                      <span style={{
+                        display: 'inline-block',
+                        width: 10, height: 10,
+                        background: row.color,
+                        borderRadius: 2,
+                        marginRight: 6,
+                        verticalAlign: 'middle',
+                      }} />
+                      {row.label}
+                    </td>
+                    <td style={{ color: '#aaa' }}>{row.r.toFixed(2)}</td>
+                    <td style={{ color: '#aaa' }}>{row.F.toFixed(1)}</td>
+                    <td style={{
+                      color: Math.abs(row.tau) < 1 ? '#888' : row.tau > 0 ? COLORS.torqueCCW : COLORS.torqueCW,
+                      fontWeight: 'bold',
+                    }}>
+                      {row.tau.toFixed(1)}
+                    </td>
+                    <td style={{
+                      color: Math.abs(row.tau) < 1 ? '#888' : row.tau > 0 ? COLORS.torqueCCW : COLORS.torqueCW,
+                      fontSize: 7,
+                    }}>
+                      {Math.abs(row.tau) < 1 ? '≈ 0' : row.tau > 0 ? '↺ CCW' : '↻ CW'}
+                    </td>
+                  </tr>
+                ))}
+                {/* Net row */}
+                <tr style={{ borderTop: '2px solid #333' }}>
+                  <td colSpan={3} style={{ color: '#aaa', textAlign: 'right' }}>NET ΣΤ =</td>
+                  <td colSpan={2} style={{
+                    color: goalMet ? '#00e676' : Math.abs(netTorque) < 20 ? '#ffd740' : '#ff5252',
+                    fontSize: 10,
+                    fontWeight: 'bold',
+                  }}>
+                    {netTorque.toFixed(1)} N·m
+                    {goalMet && <span style={{ marginLeft: 8, fontSize: 8, color: '#00e676' }}>✓ GOAL!</span>}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex gap-4 justify-center" style={{ maxWidth: CANVAS_W, margin: '0 auto' }}>
+          <button className="level-btn pixel text-xs px-5 py-3"
+            style={{
+              borderRadius: 6,
+              border: '2px solid #4a4a2a',
+              background: '#1a1a0a',
+              color: '#888',
+            }}
+            onClick={handleReset}>
+            ↺ RESET
+          </button>
+
+          {phase === 'success' && levelIdx < LEVELS.length - 1 && (
+            <button className="level-btn pixel text-xs px-5 py-3"
+              style={{
+                borderRadius: 6,
+                border: '2px solid #00e676',
+                background: '#0a1a0a',
+                color: '#00e676',
+                boxShadow: '0 0 16px rgba(0,230,118,0.4)',
+              }}
+              onClick={handleNextLevel}>
+              NEXT LEVEL →
+            </button>
+          )}
+
+          {phase === 'success' && levelIdx === LEVELS.length - 1 && (
+            <button className="level-btn pixel text-xs px-5 py-3"
+              style={{
+                borderRadius: 6,
+                border: '2px solid #ffe600',
+                background: '#1a1a00',
+                color: '#ffe600',
+                boxShadow: '0 0 16px rgba(255,230,0,0.4)',
+              }}
+              onClick={handleNextLevel}>
+              FINISH! →
+            </button>
+          )}
+
+          {phase === 'playing' && goalMet === false && (
+            <div className="pixel text-xs flex items-center"
+              style={{ color: '#4a4a6a' }}>
+              {level.goalType === 'balance'
+                ? `Need |ΣΤ| < ${level.goalValue} N·m`
+                : level.goalType === 'tip_left'
+                ? `Need ΣΤ > ${Math.abs(level.goalValue)} N·m`
+                : `Need ΣΤ > ${Math.abs(level.goalValue)} N·m`
+              }
+            </div>
+          )}
+        </div>
+
+        {/* Physics concept footer */}
+        <div className="pixel text-center pb-2" style={{ color: '#1a1a3a', fontSize: 7, lineHeight: 2 }}>
+          TORQUE TITAN v1.0 &nbsp;|&nbsp; τ = r×F &nbsp;|&nbsp; g = 9.8 m/s²
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<TorqueTitan />);
+</script>
+</body>
+</html>

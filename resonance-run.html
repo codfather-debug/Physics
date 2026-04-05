@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resonance Run</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { background: #0d0d0d; margin: 0; font-family: 'Press Start 2P', monospace; }
+    .pixel { font-family: 'Press Start 2P', monospace; }
+    canvas { display: block; image-rendering: pixelated; }
+    input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 8px; border-radius: 4px;
+      background: #1a1a2e; outline: none; cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 20px; height: 20px;
+      border-radius: 3px; background: #00ff88;
+      cursor: pointer; border: 2px solid #0d0d0d;
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 20px; height: 20px; border-radius: 3px;
+      background: #00ff88; cursor: pointer; border: 2px solid #0d0d0d;
+    }
+    @keyframes resonancePulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(255,50,50,0); background: transparent; }
+      50% { box-shadow: 0 0 30px 8px rgba(255,50,50,0.6); background: rgba(255,20,20,0.08); }
+    }
+    @keyframes warnBlink {
+      0%,100% { opacity: 1; } 50% { opacity: 0.1; }
+    }
+    .resonance-active { animation: resonancePulse 0.4s ease-in-out infinite; }
+    .warn-blink { animation: warnBlink 0.5s step-end infinite; }
+    @keyframes fadeIn { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform: translateY(0); } }
+    .fade-in { animation: fadeIn 0.4s ease forwards; }
+    @keyframes shake {
+      0%,100% { transform: translateX(0); }
+      20% { transform: translateX(-6px); }
+      40% { transform: translateX(6px); }
+      60% { transform: translateX(-4px); }
+      80% { transform: translateX(4px); }
+    }
+    .shake { animation: shake 0.4s ease; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    // ─── Constants ───────────────────────────────────────────────────────────
+    const CANVAS_W = 700;
+    const CANVAS_H = 350;
+    const PLAYER_X = 150;
+    const PLAYER_W = 22;
+    const PLAYER_H = 22;
+    const GRAVITY = 600;       // px/s²
+    const JUMP_VY = -420;      // px/s
+    const SCROLL_SPEED = 120;  // px/s
+    const PLAYER_MASS = 5;     // kg (fixed)
+    const PLATFORM_W = 86;
+    const PLATFORM_H = 12;
+    const GROUND_Y = CANVAS_H - 30; // invisible kill floor is bottom
+    const FLOOR_Y = CANVAS_H - 18;  // drawn floor level
+
+    // Boss shockwave config
+    const BOSS_CHANGE_INTERVAL = 15; // seconds
+
+    function randBetween(a, b) { return a + Math.random() * (b - a); }
+
+    function makePlatform(x, isBoss = false) {
+      return {
+        x,
+        baseY: randBetween(90, 270),
+        width: isBoss ? 100 : PLATFORM_W,
+        freq: isBoss ? randBetween(0.6, 2.2) : randBetween(0.3, 2.5),
+        amp: isBoss ? randBetween(25, 55) : randBetween(15, 60),
+        phase: Math.random() * Math.PI * 2,
+        isBoss,
+        id: Math.random(),
+      };
+    }
+
+    function initPlatforms() {
+      const plats = [];
+      // Starting platform – stationary and easy to land on
+      plats.push({ x: 80, baseY: 280, width: 160, freq: 0, amp: 0, phase: 0, isBoss: false, id: 1 });
+      let x = 280;
+      for (let i = 0; i < 5; i++) {
+        const isBoss = (i === 3);
+        plats.push(makePlatform(x, isBoss));
+        x += randBetween(130, 200);
+      }
+      return plats;
+    }
+
+    // ─── Drawing helpers ─────────────────────────────────────────────────────
+    function getPlatformY(p, t) {
+      return p.baseY + p.amp * Math.sin(2 * Math.PI * p.freq * t + p.phase);
+    }
+
+    function drawPixelRect(ctx, x, y, w, h, color) {
+      ctx.fillStyle = color;
+      ctx.fillRect(Math.round(x), Math.round(y), w, h);
+    }
+
+    function drawPlatform(ctx, p, t, resonanceWarning) {
+      const py = getPlatformY(p, t);
+      if (p.isBoss) {
+        // Glowing boss platform
+        const glow = ctx.createLinearGradient(p.x, py, p.x + p.width, py + PLATFORM_H);
+        glow.addColorStop(0, '#8b0000');
+        glow.addColorStop(0.5, '#cc2200');
+        glow.addColorStop(1, '#8b0000');
+        ctx.fillStyle = glow;
+        ctx.fillRect(Math.round(p.x), Math.round(py), p.width, PLATFORM_H);
+        // Rim
+        ctx.strokeStyle = resonanceWarning ? '#ff6600' : '#ff3300';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(Math.round(p.x) + 1, Math.round(py) + 1, p.width - 2, PLATFORM_H - 2);
+        // Pixel dots top edge
+        ctx.fillStyle = '#ff6633';
+        for (let i = 0; i < p.width; i += 8) {
+          ctx.fillRect(Math.round(p.x) + i, Math.round(py), 4, 3);
+        }
+      } else {
+        // Normal platform
+        const glow = ctx.createLinearGradient(p.x, py, p.x + p.width, py + PLATFORM_H);
+        glow.addColorStop(0, '#0d2a4a');
+        glow.addColorStop(0.5, '#1e3a5c');
+        glow.addColorStop(1, '#0d2a4a');
+        ctx.fillStyle = glow;
+        ctx.fillRect(Math.round(p.x), Math.round(py), p.width, PLATFORM_H);
+        ctx.strokeStyle = '#2a5a8c';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(Math.round(p.x) + 0.5, Math.round(py) + 0.5, p.width - 1, PLATFORM_H - 1);
+        // Pixel dots top edge
+        ctx.fillStyle = '#3a8abf';
+        for (let i = 0; i < p.width; i += 8) {
+          ctx.fillRect(Math.round(p.x) + i, Math.round(py), 4, 3);
+        }
+      }
+      // Frequency label
+      if (p.freq > 0) {
+        ctx.save();
+        ctx.font = '6px "Press Start 2P"';
+        ctx.fillStyle = p.isBoss ? '#ff9966' : '#6ab4e8';
+        ctx.textAlign = 'center';
+        ctx.fillText(`f=${p.freq.toFixed(1)}Hz`, Math.round(p.x + p.width / 2), Math.round(py - 5));
+        ctx.restore();
+      }
+    }
+
+    function drawPlayer(ctx, px, py, onGround, t, legAnim) {
+      // Shadow
+      ctx.fillStyle = 'rgba(0,255,100,0.12)';
+      ctx.fillRect(Math.round(px - 4), Math.round(py + PLAYER_H), PLAYER_W + 8, 5);
+
+      // Body
+      ctx.fillStyle = '#00ff88';
+      ctx.fillRect(Math.round(px), Math.round(py), PLAYER_W, PLAYER_H);
+
+      // Visor / face
+      ctx.fillStyle = '#001a0d';
+      ctx.fillRect(Math.round(px + 4), Math.round(py + 5), PLAYER_W - 8, 8);
+      // Eyes (scan lines)
+      ctx.fillStyle = '#00ffaa';
+      ctx.fillRect(Math.round(px + 5), Math.round(py + 7), 4, 3);
+      ctx.fillRect(Math.round(px + 13), Math.round(py + 7), 4, 3);
+
+      // Pixel border
+      ctx.strokeStyle = '#00cc66';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(Math.round(px) + 0.5, Math.round(py) + 0.5, PLAYER_W - 1, PLAYER_H - 1);
+
+      // Animated legs (only when on ground)
+      if (onGround) {
+        const legOffset = Math.sin(legAnim) > 0 ? 3 : 0;
+        ctx.fillStyle = '#00cc66';
+        ctx.fillRect(Math.round(px + 3), Math.round(py + PLAYER_H), 6, 4 + legOffset);
+        ctx.fillRect(Math.round(px + 13), Math.round(py + PLAYER_H), 6, 4 + (3 - legOffset));
+      } else {
+        // Tucked legs
+        ctx.fillStyle = '#00cc66';
+        ctx.fillRect(Math.round(px + 3), Math.round(py + PLAYER_H), 6, 3);
+        ctx.fillRect(Math.round(px + 13), Math.round(py + PLAYER_H), 6, 3);
+      }
+    }
+
+    function drawShockwave(ctx, waves) {
+      waves.forEach(w => {
+        ctx.beginPath();
+        ctx.arc(w.x, w.y, w.r, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255,${80 + Math.floor(w.alpha * 120)},0,${w.alpha})`;
+        ctx.lineWidth = 3 * w.alpha + 1;
+        ctx.stroke();
+        // Inner ring
+        if (w.r > 20) {
+          ctx.beginPath();
+          ctx.arc(w.x, w.y, w.r * 0.6, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(255,200,0,${w.alpha * 0.5})`;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      });
+    }
+
+    function drawBackground(ctx, scrollOffset) {
+      // Deep background
+      ctx.fillStyle = '#0d0d0d';
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+      // Parallax grid lines (slow)
+      ctx.strokeStyle = 'rgba(0,100,60,0.08)';
+      ctx.lineWidth = 1;
+      const gridSize = 60;
+      const gridOff = (scrollOffset * 0.2) % gridSize;
+      for (let x = -gridOff; x < CANVAS_W; x += gridSize) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, CANVAS_H); ctx.stroke();
+      }
+      for (let y = 0; y < CANVAS_H; y += gridSize) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(CANVAS_W, y); ctx.stroke();
+      }
+
+      // Stars (pixel dots)
+      ctx.fillStyle = 'rgba(100,200,255,0.3)';
+      const starSeed = [37,113,229,347,467,593,701,809,919];
+      starSeed.forEach((s, i) => {
+        const sx = ((s * 73 - scrollOffset * 0.05) % (CANVAS_W + 40) + CANVAS_W + 40) % (CANVAS_W + 40) - 20;
+        const sy = (s * 31) % (CANVAS_H * 0.7);
+        ctx.fillRect(Math.round(sx), Math.round(sy), 2, 2);
+      });
+
+      // Ground strip
+      const groundGrad = ctx.createLinearGradient(0, FLOOR_Y - 2, 0, CANVAS_H);
+      groundGrad.addColorStop(0, '#0a1f0a');
+      groundGrad.addColorStop(1, '#050d05');
+      ctx.fillStyle = groundGrad;
+      ctx.fillRect(0, FLOOR_Y - 2, CANVAS_W, CANVAS_H - FLOOR_Y + 2);
+      ctx.strokeStyle = '#1a4a1a';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(0, FLOOR_Y - 2); ctx.lineTo(CANVAS_W, FLOOR_Y - 2); ctx.stroke();
+      // Ground tick marks
+      ctx.strokeStyle = '#0d2a0d';
+      ctx.lineWidth = 1;
+      const tickOff = scrollOffset % 30;
+      for (let x = -tickOff; x < CANVAS_W; x += 30) {
+        ctx.beginPath(); ctx.moveTo(x, FLOOR_Y - 2); ctx.lineTo(x, FLOOR_Y + 4); ctx.stroke();
+      }
+    }
+
+    function drawHUD(ctx, t, bossFreq, playerFN, score, resonanceWarning, bossTimer) {
+      // Semi-transparent equation overlays (top-left)
+      ctx.save();
+      ctx.font = '7px "Press Start 2P"';
+      ctx.fillStyle = 'rgba(0,180,100,0.18)';
+      ctx.fillText('ω = √(k/m)', 10, 20);
+      ctx.fillText('f = ω/2π', 10, 34);
+      ctx.restore();
+
+      // Score (top right)
+      ctx.save();
+      ctx.font = '8px "Press Start 2P"';
+      ctx.fillStyle = '#00ff88';
+      ctx.textAlign = 'right';
+      ctx.fillText(`${Math.floor(score)}m`, CANVAS_W - 12, 20);
+      ctx.restore();
+
+      // Boss freq indicator (bottom)
+      const bossX = CANVAS_W / 2;
+      ctx.save();
+      ctx.font = '7px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      const bossAlpha = resonanceWarning ? (0.7 + 0.3 * Math.sin(t * 16)) : 0.9;
+      ctx.fillStyle = resonanceWarning
+        ? `rgba(255,80,0,${bossAlpha})`
+        : 'rgba(200,80,80,0.85)';
+      ctx.fillText(`BOSS: ${bossFreq.toFixed(2)} Hz`, bossX, CANVAS_H - 8);
+
+      // Boss timer pip bar
+      const barW = 80;
+      const barH = 4;
+      const bx = bossX - barW / 2;
+      const by = CANVAS_H - 20;
+      ctx.fillStyle = 'rgba(60,0,0,0.7)';
+      ctx.fillRect(bx, by, barW, barH);
+      const frac = Math.max(0, bossTimer / BOSS_CHANGE_INTERVAL);
+      ctx.fillStyle = resonanceWarning ? '#ff4400' : '#aa2200';
+      ctx.fillRect(bx, by, barW * frac, barH);
+      ctx.strokeStyle = '#441100';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx, by, barW, barH);
+      ctx.restore();
+    }
+
+    function drawTitleScreen(ctx) {
+      ctx.fillStyle = '#0d0d0d';
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+      // Grid
+      ctx.strokeStyle = 'rgba(0,180,80,0.07)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < CANVAS_W; x += 40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,CANVAS_H); ctx.stroke(); }
+      for (let y = 0; y < CANVAS_H; y += 40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(CANVAS_W,y); ctx.stroke(); }
+
+      // Title
+      ctx.save();
+      ctx.font = '28px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#00ff88';
+      ctx.shadowColor = '#00ff88';
+      ctx.shadowBlur = 24;
+      ctx.fillText('RESONANCE', CANVAS_W / 2, 90);
+      ctx.shadowBlur = 18;
+      ctx.fillText('RUN', CANVAS_W / 2, 128);
+      ctx.shadowBlur = 0;
+      ctx.restore();
+
+      // Subtitle
+      ctx.save();
+      ctx.font = '8px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#3a8a6a';
+      ctx.fillText('SIMPLE HARMONIC MOTION', CANVAS_W / 2, 162);
+      ctx.restore();
+
+      // Instructions box
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,30,15,0.8)';
+      ctx.strokeStyle = '#1a4a2a';
+      ctx.lineWidth = 1;
+      const bx = CANVAS_W/2 - 220, by = 182, bw = 440, bh = 110;
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.strokeRect(bx, by, bw, bh);
+
+      ctx.font = '7px "Press Start 2P"';
+      ctx.fillStyle = '#4ab87a';
+      ctx.textAlign = 'center';
+      ctx.fillText('SPACE / CLICK  →  JUMP', CANVAS_W/2, by + 22);
+      ctx.fillText('ADJUST k SLIDER TO CHANGE YOUR', CANVAS_W/2, by + 44);
+      ctx.fillText('NATURAL FREQUENCY  ω = √(k/m)', CANVAS_W/2, by + 62);
+      ctx.fillStyle = '#cc4422';
+      ctx.fillText('AVOID RESONANCE WITH THE BOSS!', CANVAS_W/2, by + 84);
+      ctx.fillStyle = '#cc4422';
+      ctx.fillText('|f_n - f_boss| / f_boss < 5%  →  BOOM', CANVAS_W/2, by + 100);
+      ctx.restore();
+
+      // Blink
+      const blinkOn = Math.floor(Date.now() / 600) % 2 === 0;
+      if (blinkOn) {
+        ctx.save();
+        ctx.font = '9px "Press Start 2P"';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#00ff88';
+        ctx.shadowColor = '#00ff88';
+        ctx.shadowBlur = 8;
+        ctx.fillText('▶ PRESS SPACE OR CLICK TO START ◀', CANVAS_W/2, 318);
+        ctx.restore();
+      }
+    }
+
+    function drawGameOver(ctx, score, highScore, deathReason) {
+      ctx.fillStyle = 'rgba(0,0,0,0.72)';
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+      ctx.save();
+      ctx.font = '24px "Press Start 2P"';
+      ctx.textAlign = 'center';
+      if (deathReason === 'resonance') {
+        ctx.fillStyle = '#ff3300';
+        ctx.shadowColor = '#ff3300';
+        ctx.shadowBlur = 30;
+        ctx.fillText('RESONANCE!', CANVAS_W/2, 100);
+      } else {
+        ctx.fillStyle = '#ff6644';
+        ctx.shadowColor = '#ff4422';
+        ctx.shadowBlur = 20;
+        ctx.fillText('GAME OVER', CANVAS_W/2, 100);
+      }
+      ctx.shadowBlur = 0;
+
+      ctx.font = '9px "Press Start 2P"';
+      ctx.fillStyle = '#aaaaaa';
+      if (deathReason === 'resonance') {
+        ctx.fillText('YOUR FREQUENCY MATCHED THE BOSS', CANVAS_W/2, 135);
+        ctx.fillText('THE STRUCTURE COLLAPSED!', CANVAS_W/2, 155);
+      } else {
+        ctx.fillText('YOU FELL OFF THE PLATFORM', CANVAS_W/2, 140);
+      }
+
+      ctx.font = '11px "Press Start 2P"';
+      ctx.fillStyle = '#00ff88';
+      ctx.fillText(`DISTANCE: ${Math.floor(score)} m`, CANVAS_W/2, 200);
+      ctx.fillStyle = '#ffdd00';
+      ctx.fillText(`BEST: ${Math.floor(highScore)} m`, CANVAS_W/2, 228);
+
+      const blinkOn = Math.floor(Date.now() / 700) % 2 === 0;
+      if (blinkOn) {
+        ctx.font = '8px "Press Start 2P"';
+        ctx.fillStyle = '#00ff88';
+        ctx.fillText('SPACE / CLICK TO RESTART', CANVAS_W/2, 290);
+      }
+      ctx.restore();
+    }
+
+    // ─── Main App ────────────────────────────────────────────────────────────
+    function App() {
+      const canvasRef = useRef(null);
+      const stateRef = useRef({
+        gameState: 'title',
+        playerY: 260,
+        playerVY: 0,
+        onGround: false,
+        platforms: [],
+        scrollOffset: 0,
+        t: 0,
+        score: 0,
+        highScore: 0,
+        k: 100,
+        bossFreq: 1.0,
+        bossTimer: BOSS_CHANGE_INTERVAL,
+        shockwaves: [],
+        bossShockTimer: 0,
+        legAnim: 0,
+        deathReason: 'fall',
+        resonanceWarning: false,
+        flashRed: 0,
+        shakeCooldown: 0,
+      });
+      const rafRef = useRef(null);
+      const lastTimeRef = useRef(null);
+
+      // React state (for UI panel only)
+      const [uiState, setUiState] = useState({
+        gameState: 'title',
+        k: 100,
+        omegaN: 0,
+        freqN: 0,
+        bossFreq: 1.0,
+        score: 0,
+        highScore: 0,
+        resonanceWarning: false,
+        flashRed: false,
+      });
+
+      const kRef = useRef(100);
+
+      // Derived physics
+      function computeFreqs(k) {
+        const omegaN = Math.sqrt(k / PLAYER_MASS);
+        const freqN = omegaN / (2 * Math.PI);
+        return { omegaN, freqN };
+      }
+
+      function startGame() {
+        const s = stateRef.current;
+        s.gameState = 'playing';
+        s.playerY = 258;
+        s.playerVY = 0;
+        s.onGround = false;
+        s.platforms = initPlatforms();
+        s.scrollOffset = 0;
+        s.t = 0;
+        s.score = 0;
+        s.bossFreq = parseFloat((randBetween(0.5, 2.2)).toFixed(2));
+        s.bossTimer = BOSS_CHANGE_INTERVAL;
+        s.shockwaves = [];
+        s.bossShockTimer = 0;
+        s.legAnim = 0;
+        s.deathReason = 'fall';
+        s.resonanceWarning = false;
+        s.flashRed = 0;
+        s.shakeCooldown = 0;
+        updateUI();
+      }
+
+      function updateUI() {
+        const s = stateRef.current;
+        const { omegaN, freqN } = computeFreqs(s.k);
+        setUiState({
+          gameState: s.gameState,
+          k: s.k,
+          omegaN,
+          freqN,
+          bossFreq: s.bossFreq,
+          score: Math.floor(s.score),
+          highScore: Math.floor(s.highScore),
+          resonanceWarning: s.resonanceWarning,
+          flashRed: s.flashRed > 0,
+        });
+      }
+
+      function handleInput() {
+        const s = stateRef.current;
+        if (s.gameState === 'title') {
+          startGame();
+          return;
+        }
+        if (s.gameState === 'gameover') {
+          startGame();
+          return;
+        }
+        if (s.gameState === 'playing' && s.onGround) {
+          s.playerVY = JUMP_VY;
+          s.onGround = false;
+        }
+      }
+
+      useEffect(() => {
+        const onKey = (e) => { if (e.code === 'Space') { e.preventDefault(); handleInput(); } };
+        const onClick = () => handleInput();
+        window.addEventListener('keydown', onKey);
+        const canvas = canvasRef.current;
+        if (canvas) canvas.addEventListener('click', onClick);
+        return () => {
+          window.removeEventListener('keydown', onKey);
+          if (canvas) canvas.removeEventListener('click', onClick);
+        };
+      }, []);
+
+      // Main game loop
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+
+        function loop(ts) {
+          if (lastTimeRef.current === null) lastTimeRef.current = ts;
+          const rawDt = Math.min((ts - lastTimeRef.current) / 1000, 0.05);
+          lastTimeRef.current = ts;
+
+          const s = stateRef.current;
+          // Always sync k from slider ref
+          s.k = kRef.current;
+
+          if (s.gameState === 'title') {
+            drawTitleScreen(ctx);
+            rafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+
+          if (s.gameState === 'gameover') {
+            // Keep rendering last frame + overlay
+            ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+            drawBackground(ctx, s.scrollOffset);
+            s.platforms.forEach(p => drawPlatform(ctx, p, s.t, s.resonanceWarning));
+            drawPlayer(ctx, PLAYER_X, s.playerY, s.onGround, s.t, s.legAnim);
+            drawGameOver(ctx, s.score, s.highScore, s.deathReason);
+            rafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+
+          // ── Update ──────────────────────────────────────────────────────
+          const dt = rawDt;
+          s.t += dt;
+          s.score += (SCROLL_SPEED * dt) / 10; // score in "meters" (10px = 1m)
+          s.scrollOffset += SCROLL_SPEED * dt;
+
+          // Boss timer
+          s.bossTimer -= dt;
+          if (s.bossTimer <= 0) {
+            s.bossFreq = parseFloat((randBetween(0.5, 2.5)).toFixed(2));
+            s.bossTimer = BOSS_CHANGE_INTERVAL;
+          }
+
+          // Boss shockwave emission
+          s.bossShockTimer -= dt;
+          if (s.bossShockTimer <= 0) {
+            // Emit shockwave from each boss platform
+            s.platforms.forEach(p => {
+              if (p.isBoss) {
+                const py = getPlatformY(p, s.t);
+                s.shockwaves.push({ x: p.x + p.width / 2, y: py, r: 8, alpha: 0.9 });
+              }
+            });
+            s.bossShockTimer = 1 / s.bossFreq; // one pulse per boss cycle
+          }
+
+          // Update shockwaves
+          s.shockwaves = s.shockwaves.filter(w => w.alpha > 0.01).map(w => ({
+            ...w,
+            r: w.r + 90 * dt,
+            alpha: w.alpha - 1.1 * dt,
+          }));
+
+          // Gravity & player physics
+          if (!s.onGround) {
+            s.playerVY += GRAVITY * dt;
+          }
+          s.playerY += s.playerVY * dt;
+
+          // Leg animation
+          if (s.onGround) s.legAnim += dt * 14;
+
+          // Scroll platforms
+          s.platforms.forEach(p => { p.x -= SCROLL_SPEED * dt; });
+
+          // Remove off-screen, generate new
+          s.platforms = s.platforms.filter(p => p.x + p.width > -20);
+          // Find max X
+          if (s.platforms.length < 6) {
+            const maxX = s.platforms.reduce((m, p) => Math.max(m, p.x + p.width), 0);
+            const gap = randBetween(120, 190);
+            const bossCount = s.platforms.filter(p => p.isBoss).length;
+            const makeBoss = bossCount < 1 && Math.random() < 0.35;
+            s.platforms.push(makePlatform(maxX + gap, makeBoss));
+          }
+
+          // Collision detection
+          s.onGround = false;
+          for (const p of s.platforms) {
+            const py = getPlatformY(p, s.t);
+            const playerBottom = s.playerY + PLAYER_H;
+            const playerLeft = PLAYER_X;
+            const playerRight = PLAYER_X + PLAYER_W;
+
+            // Horizontal overlap
+            if (playerRight > p.x + 4 && playerLeft < p.x + p.width - 4) {
+              // Landing: player falling, bottom near platform top
+              if (s.playerVY >= 0 && playerBottom >= py - 2 && playerBottom <= py + PLATFORM_H + 10) {
+                s.playerY = py - PLAYER_H;
+                s.playerVY = 0;
+                s.onGround = true;
+
+                // Resonance check on boss platform
+                if (p.isBoss) {
+                  const { freqN } = computeFreqs(s.k);
+                  const diff = Math.abs(freqN - s.bossFreq) / s.bossFreq;
+                  if (diff < 0.05) {
+                    // RESONANCE → game over
+                    s.deathReason = 'resonance';
+                    s.flashRed = 1;
+                    if (s.score > s.highScore) s.highScore = s.score;
+                    s.gameState = 'gameover';
+                    updateUI();
+                    rafRef.current = requestAnimationFrame(loop);
+                    return;
+                  }
+                }
+                break;
+              }
+            }
+          }
+
+          // Fall death
+          if (s.playerY > CANVAS_H + 10) {
+            s.deathReason = 'fall';
+            if (s.score > s.highScore) s.highScore = s.score;
+            s.gameState = 'gameover';
+            updateUI();
+            rafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+
+          // Clamp player above ceiling
+          if (s.playerY < 10) { s.playerY = 10; s.playerVY = Math.abs(s.playerVY) * 0.3; }
+
+          // Resonance warning (within 10%)
+          const { freqN } = computeFreqs(s.k);
+          const diff = Math.abs(freqN - s.bossFreq) / s.bossFreq;
+          s.resonanceWarning = diff < 0.10;
+          if (s.resonanceWarning) s.flashRed = Math.max(s.flashRed, 0.5);
+          s.flashRed = Math.max(0, s.flashRed - dt * 1.5);
+
+          // ── Draw ─────────────────────────────────────────────────────────
+          ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+          // Red flash overlay
+          if (s.flashRed > 0) {
+            ctx.fillStyle = `rgba(200,0,0,${s.flashRed * 0.25})`;
+            ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+          }
+
+          drawBackground(ctx, s.scrollOffset);
+          drawShockwave(ctx, s.shockwaves);
+          s.platforms.forEach(p => drawPlatform(ctx, p, s.t, s.resonanceWarning));
+          drawPlayer(ctx, PLAYER_X, s.playerY, s.onGround, s.t, s.legAnim);
+          drawHUD(ctx, s.t, s.bossFreq, freqN, s.score, s.resonanceWarning, s.bossTimer);
+
+          // Red flash border
+          if (s.resonanceWarning) {
+            const alpha = 0.3 + 0.3 * Math.abs(Math.sin(s.t * 12));
+            ctx.strokeStyle = `rgba(255,50,0,${alpha})`;
+            ctx.lineWidth = 6;
+            ctx.strokeRect(3, 3, CANVAS_W - 6, CANVAS_H - 6);
+          }
+
+          // Update UI every ~10 frames
+          if (Math.round(s.t * 60) % 6 === 0) updateUI();
+
+          rafRef.current = requestAnimationFrame(loop);
+        }
+
+        rafRef.current = requestAnimationFrame(loop);
+        return () => {
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+          lastTimeRef.current = null;
+        };
+      }, []);
+
+      const { omegaN, freqN } = computeFreqs(uiState.k);
+      const warnClose = uiState.resonanceWarning;
+
+      return (
+        <div className="min-h-screen py-6 px-4" style={{ background: '#0d0d0d' }}>
+          <div className="max-w-3xl mx-auto space-y-4">
+
+            {/* Header */}
+            <div className="flex items-center justify-between">
+              <a href="index.html" className="pixel text-xs"
+                 style={{ color: '#4a8c5c', textDecoration: 'none', letterSpacing: '0.05em' }}>
+                ← MENU
+              </a>
+              <div className="pixel text-center" style={{ color: '#00ff88', fontSize: '13px',
+                textShadow: '0 0 16px #00ff88, 2px 2px 0 #003322', lineHeight: '1.8' }}>
+                RESONANCE RUN
+              </div>
+              <div className="pixel text-xs" style={{ color: '#1a4a2a', minWidth: '60px', textAlign: 'right' }}>
+                SHM
+              </div>
+            </div>
+
+            {/* Canvas */}
+            <div className={`relative rounded-xl overflow-hidden ${warnClose ? 'resonance-active' : ''}`}
+                 style={{ border: `2px solid ${warnClose ? '#aa2200' : '#1a3a1a'}`,
+                          boxShadow: warnClose ? '0 0 30px rgba(200,40,0,0.4)' : '0 0 20px rgba(0,255,88,0.08)' }}>
+              <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H}
+                      style={{ width: '100%', height: 'auto', cursor: 'pointer' }} />
+            </div>
+
+            {/* Controls */}
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+
+              {/* Spring constant slider */}
+              <div className="rounded-xl p-4 space-y-3"
+                   style={{ background: '#0a1a0a', border: '1px solid #1a3a1a' }}>
+                <div className="pixel text-xs" style={{ color: '#4ab870', marginBottom: '6px' }}>
+                  SPRING CONSTANT  k
+                </div>
+                <input
+                  type="range" min="10" max="500" step="5"
+                  value={uiState.k}
+                  onChange={e => {
+                    const v = parseInt(e.target.value);
+                    kRef.current = v;
+                    stateRef.current.k = v;
+                    const { omegaN, freqN } = computeFreqs(v);
+                    setUiState(prev => ({ ...prev, k: v, omegaN, freqN,
+                      resonanceWarning: Math.abs(freqN - prev.bossFreq) / prev.bossFreq < 0.10 }));
+                  }}
+                />
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded p-2 text-center" style={{ background: '#050f05', border: '1px solid #0d2a0d' }}>
+                    <div className="pixel" style={{ color: '#3a6a3a', fontSize: '7px', marginBottom: '4px' }}>k (N/m)</div>
+                    <div className="pixel" style={{ color: '#00ff88', fontSize: '10px' }}>{uiState.k}</div>
+                  </div>
+                  <div className="rounded p-2 text-center" style={{ background: '#050f05', border: '1px solid #0d2a0d' }}>
+                    <div className="pixel" style={{ color: '#3a6a3a', fontSize: '7px', marginBottom: '4px' }}>ω (rad/s)</div>
+                    <div className="pixel" style={{ color: '#44ddaa', fontSize: '10px' }}>{omegaN.toFixed(2)}</div>
+                  </div>
+                  <div className="rounded p-2 text-center"
+                       style={{ background: warnClose ? '#1a0505' : '#050f05',
+                                border: `1px solid ${warnClose ? '#660000' : '#0d2a0d'}`,
+                                transition: 'all 0.2s' }}>
+                    <div className="pixel" style={{ color: warnClose ? '#aa4444' : '#3a6a3a', fontSize: '7px', marginBottom: '4px' }}>f_n (Hz)</div>
+                    <div className={`pixel ${warnClose ? 'warn-blink' : ''}`}
+                         style={{ color: warnClose ? '#ff4444' : '#44ddaa', fontSize: '10px' }}>
+                      {freqN.toFixed(3)}
+                    </div>
+                  </div>
+                </div>
+                <div className="pixel text-center" style={{ color: '#1a3a1a', fontSize: '7px', lineHeight: '1.8' }}>
+                  m = {PLAYER_MASS} kg (fixed) &nbsp;|&nbsp; ω = √(k/m)
+                </div>
+              </div>
+
+              {/* Boss + Score panel */}
+              <div className="rounded-xl p-4 space-y-3"
+                   style={{ background: '#0f0808', border: `1px solid ${warnClose ? '#661100' : '#2a1010'}` }}>
+                <div className="pixel text-xs" style={{ color: '#cc4422', marginBottom: '4px' }}>
+                  BOSS FREQUENCY
+                </div>
+
+                {/* Boss freq display */}
+                <div className="rounded-lg p-3 text-center"
+                     style={{ background: '#0a0505', border: `2px solid ${warnClose ? '#cc2200' : '#441100'}` }}>
+                  <div className="pixel" style={{ color: '#662200', fontSize: '7px', marginBottom: '4px' }}>
+                    f_boss (Hz)
+                  </div>
+                  <div className={`pixel ${warnClose ? 'warn-blink' : ''}`}
+                       style={{ color: warnClose ? '#ff3300' : '#dd4422', fontSize: '18px',
+                                textShadow: warnClose ? '0 0 14px #ff3300' : 'none' }}>
+                    {uiState.bossFreq.toFixed(2)}
+                  </div>
+                  <div className="pixel mt-2" style={{ color: '#441100', fontSize: '7px' }}>
+                    CHANGES EVERY 15s
+                  </div>
+                </div>
+
+                {/* Warning indicator */}
+                {warnClose ? (
+                  <div className="rounded p-2 text-center warn-blink fade-in"
+                       style={{ background: '#1a0000', border: '2px solid #cc0000' }}>
+                    <div className="pixel" style={{ color: '#ff3300', fontSize: '8px' }}>
+                      ⚠ RESONANCE DANGER ⚠
+                    </div>
+                    <div className="pixel mt-1" style={{ color: '#882200', fontSize: '6px' }}>
+                      CHANGE k NOW!
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded p-2 text-center"
+                       style={{ background: '#030a03', border: '1px solid #0d2a0d' }}>
+                    <div className="pixel" style={{ color: '#1a4a1a', fontSize: '7px' }}>STATUS: SAFE</div>
+                  </div>
+                )}
+
+                {/* Score */}
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded p-2 text-center" style={{ background: '#030a03', border: '1px solid #0d2a0d' }}>
+                    <div className="pixel" style={{ color: '#1a4a1a', fontSize: '7px', marginBottom: '3px' }}>DISTANCE</div>
+                    <div className="pixel" style={{ color: '#00ff88', fontSize: '11px' }}>{uiState.score}m</div>
+                  </div>
+                  <div className="rounded p-2 text-center" style={{ background: '#030a03', border: '1px solid #2a2a00' }}>
+                    <div className="pixel" style={{ color: '#3a3a00', fontSize: '7px', marginBottom: '3px' }}>BEST</div>
+                    <div className="pixel" style={{ color: '#ffdd00', fontSize: '11px' }}>{uiState.highScore}m</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Physics info strip */}
+            <div className="rounded-xl px-4 py-3"
+                 style={{ background: '#080808', border: '1px solid #111' }}>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
+                <div>
+                  <div className="pixel" style={{ color: '#1a3a2a', fontSize: '6px', marginBottom: '3px' }}>CONCEPT</div>
+                  <div className="pixel" style={{ color: '#2a6a4a', fontSize: '7px' }}>SHM / RESONANCE</div>
+                </div>
+                <div>
+                  <div className="pixel" style={{ color: '#1a3a2a', fontSize: '6px', marginBottom: '3px' }}>NATURAL FREQ</div>
+                  <div className="pixel" style={{ color: '#2a6a4a', fontSize: '7px' }}>ω = √(k/m)</div>
+                </div>
+                <div>
+                  <div className="pixel" style={{ color: '#1a3a2a', fontSize: '6px', marginBottom: '3px' }}>PLATFORM MOTION</div>
+                  <div className="pixel" style={{ color: '#2a6a4a', fontSize: '7px' }}>y = A·sin(2πft+φ)</div>
+                </div>
+                <div>
+                  <div className="pixel" style={{ color: '#1a3a2a', fontSize: '6px', marginBottom: '3px' }}>DANGER ZONE</div>
+                  <div className="pixel" style={{ color: '#4a1a1a', fontSize: '7px' }}>|f_n-f_b|/f_b &lt; 5%</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="pixel text-center pb-4"
+                 style={{ color: '#111', fontSize: '7px', lineHeight: '2' }}>
+              PHYSICS ENGINE v1.0 &nbsp;|&nbsp; SHM · RESONANCE · ω = √(k/m)
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,1299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Circuit Overload</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background: #0d0d0d; margin: 0; font-family: 'Press Start 2P', monospace; }
+    * { box-sizing: border-box; }
+    .pixel { font-family: 'Press Start 2P', monospace; }
+    canvas { display: block; image-rendering: pixelated; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    @keyframes pulse-glow { 0%,100%{box-shadow:0 0 8px #ff4444} 50%{box-shadow:0 0 24px #ff4444, 0 0 48px #ff4444} }
+    @keyframes scanline { 0%{transform:translateY(-100%)} 100%{transform:translateY(100vh)} }
+    .fuse-blown { animation: pulse-glow 0.5s ease-in-out infinite; }
+    .blink-fast { animation: blink 0.4s step-end infinite; }
+    ::-webkit-scrollbar { width: 6px; background: #0d0d0d; }
+    ::-webkit-scrollbar-thumb { background: #1a1a3a; border-radius: 3px; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-buy { transition: background 0.1s, box-shadow 0.1s; }
+    .btn-buy:hover:not(:disabled) { box-shadow: 0 0 12px #00ffff88; }
+    .tower-slot { cursor: pointer; transition: opacity 0.15s; }
+    .tower-slot:hover { opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const CANVAS_W = 700;
+    const CANVAS_H = 400;
+    const PATH_Y = 230;
+    const TOWER_Y = 120;
+    const TOWER_R = 2;      // Ohms per tower
+    const V_BAT = 12;       // Volts
+    const FUSE_LIMIT = 10;  // Amps
+    const FUSE_DURATION = 5; // seconds
+    const TOWER_RANGE = 85;
+    const TOWER_COST = 50;
+    const TOWER_SELL = 25;
+    const FUSE_RESET_COST = 20;
+    const CREEP_DAMAGE = 1;  // life lost per leaking creep
+
+    const SERIES_SLOTS = [
+      { x: 110, y: TOWER_Y, label: 'S1' },
+      { x: 230, y: TOWER_Y, label: 'S2' },
+      { x: 350, y: TOWER_Y, label: 'S3' },
+    ];
+    const PARALLEL_SLOTS = [
+      { x: 410, y: TOWER_Y, label: 'P1' },
+      { x: 530, y: TOWER_Y, label: 'P2' },
+      { x: 650, y: TOWER_Y, label: 'P3' },
+    ];
+    const ALL_SLOTS = [
+      ...SERIES_SLOTS.map((s,i)=>({...s, row:'series', idx:i})),
+      ...PARALLEL_SLOTS.map((s,i)=>({...s, row:'parallel', idx:i})),
+    ];
+
+    // Path: straight with one zigzag
+    const PATH = [
+      {x:-20, y:PATH_Y},
+      {x:160,  y:PATH_Y},
+      {x:200,  y:PATH_Y-60},
+      {x:300,  y:PATH_Y-60},
+      {x:340,  y:PATH_Y+40},
+      {x:460,  y:PATH_Y+40},
+      {x:500,  y:PATH_Y-50},
+      {x:600,  y:PATH_Y-50},
+      {x:640,  y:PATH_Y},
+      {x:720,  y:PATH_Y},
+    ];
+
+    function pathLength(pts) {
+      let len = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const dx = pts[i].x - pts[i-1].x, dy = pts[i].y - pts[i-1].y;
+        len += Math.sqrt(dx*dx + dy*dy);
+      }
+      return len;
+    }
+    function posAlongPath(pts, dist) {
+      let remaining = dist;
+      for (let i = 1; i < pts.length; i++) {
+        const dx = pts[i].x - pts[i-1].x, dy = pts[i].y - pts[i-1].y;
+        const seg = Math.sqrt(dx*dx + dy*dy);
+        if (remaining <= seg) {
+          const t = remaining / seg;
+          return { x: pts[i-1].x + dx*t, y: pts[i-1].y + dy*t };
+        }
+        remaining -= seg;
+      }
+      return pts[pts.length-1];
+    }
+    const TOTAL_PATH_LEN = pathLength(PATH);
+
+    // ─── Wave definitions ─────────────────────────────────────────────────────
+    const WAVES = [
+      { normal:5,  resistor:0, speed:55 },
+      { normal:8,  resistor:2, speed:60 },
+      { normal:12, resistor:4, speed:70 },
+      { normal:15, resistor:6, speed:80 },
+      { normal:10, resistor:0, speed:65, boss:1 }, // wave 5: boss + normals
+    ];
+
+    // ─── Circuit math ─────────────────────────────────────────────────────────
+    function calcCircuit(nSeries, nParallel) {
+      const V_series  = nSeries  > 0 ? V_BAT / nSeries : 0;
+      const I_series  = nSeries  > 0 ? V_BAT / (nSeries * TOWER_R) : 0;
+      const V_parallel= nParallel> 0 ? V_BAT : 0;
+      const I_parallel= nParallel> 0 ? nParallel * (V_BAT / TOWER_R) : 0;
+      const I_total   = I_series + I_parallel;
+      return { V_series, I_series, V_parallel, I_parallel, I_total };
+    }
+
+    // ─── ID generator ─────────────────────────────────────────────────────────
+    let _id = 1;
+    const uid = () => _id++;
+
+    // ─── Main App ─────────────────────────────────────────────────────────────
+    function App() {
+      const canvasRef = useRef(null);
+      const stateRef  = useRef(null); // mutable game state for loop
+      const rafRef    = useRef(null);
+      const lastTRef  = useRef(null);
+
+      // React UI state (display only)
+      const [ui, setUi] = useState({
+        phase: 'menu',   // menu | building | wave | gameover | win
+        coins: 150,
+        lives: 5,
+        wave: 0,
+        seriesCount: 0,
+        parallelCount: 0,
+        fuseBlown: false,
+        fuseTimer: 0,
+        circuit: calcCircuit(0, 0),
+        totalPower: 0,
+        waveInProgress: false,
+        waveNum: 0,
+        creepsLeft: 0,
+      });
+
+      // ── Initialize game state ──────────────────────────────────────────────
+      function makeInitialState() {
+        return {
+          phase: 'building',
+          coins: 150,
+          lives: 5,
+          wave: 0,           // next wave to start (0-indexed)
+          seriesTowers: [],  // {id, slotIdx, fireTimer}
+          parallelTowers: [],
+          creeps: [],
+          projectiles: [],
+          particles: [],
+          fuseBlown: false,
+          fuseTimer: 0,
+          spawnQueue: [],    // [{type, delay}] remaining to spawn
+          spawnTimer: 0,
+          waveInProgress: false,
+          creepsAlive: 0,
+          waveNum: 0,        // 1-indexed display
+        };
+      }
+
+      function startGame() {
+        const s = makeInitialState();
+        stateRef.current = s;
+        syncUi(s);
+        setUi(u => ({...u, phase: 'building'}));
+        startLoop();
+      }
+
+      // ── Sync display ──────────────────────────────────────────────────────
+      function syncUi(s) {
+        const nS = s.seriesTowers.length;
+        const nP = s.parallelTowers.length;
+        const circ = calcCircuit(nS, nP);
+        let totalP = 0;
+        if (!s.fuseBlown) {
+          s.seriesTowers.forEach(() => totalP += circ.I_series * circ.V_series);
+          s.parallelTowers.forEach(() => totalP += (V_BAT / TOWER_R) * V_BAT);
+        }
+        setUi({
+          phase: s.phase,
+          coins: s.coins,
+          lives: s.lives,
+          wave: s.wave,
+          seriesCount: nS,
+          parallelCount: nP,
+          fuseBlown: s.fuseBlown,
+          fuseTimer: s.fuseTimer,
+          circuit: circ,
+          totalPower: totalP,
+          waveInProgress: s.waveInProgress,
+          waveNum: s.waveNum,
+          creepsLeft: s.creeps.length + s.spawnQueue.length,
+        });
+      }
+
+      // ── Build wave spawn queue ─────────────────────────────────────────────
+      function buildSpawnQueue(waveIdx) {
+        const def = WAVES[waveIdx];
+        const queue = [];
+        if (def.boss) queue.push({type:'boss', delay:0});
+        for (let i = 0; i < def.normal; i++)    queue.push({type:'normal',   delay: (i+1)*1.2});
+        for (let i = 0; i < def.resistor; i++)  queue.push({type:'resistor', delay: (i+1)*1.4 + def.normal*1.2});
+        // shuffle non-boss
+        const fixed = queue.filter(c=>c.type==='boss');
+        const rest  = queue.filter(c=>c.type!=='boss').sort(()=>Math.random()-0.5);
+        // reassign delays in order
+        const all = [...fixed, ...rest];
+        let t = 0;
+        return all.map((c,i) => { const d = i===0&&c.type==='boss'?0: t+=1.3; return {...c, delay:d}; });
+      }
+
+      function spawnCreep(type, waveIdx) {
+        const def = WAVES[waveIdx];
+        const base = {
+          id: uid(),
+          dist: 0,
+          x: PATH[0].x,
+          y: PATH[0].y,
+          type,
+        };
+        if (type === 'boss') return {...base, hp:20, maxHp:20, speed:35, r:18, color:'#ff2200', label:'BOSS'};
+        if (type === 'resistor') return {...base, hp:6, maxHp:6, speed:def.speed*0.75, r:11, color:'#ff8800', label:'RES'};
+        return {...base, hp:3, maxHp:3, speed:def.speed, r:9, color:'#ff5533', label:null};
+      }
+
+      // ── Launch next wave ───────────────────────────────────────────────────
+      function startWave() {
+        const s = stateRef.current;
+        if (!s || s.waveInProgress || s.wave >= WAVES.length) return;
+        s.spawnQueue = buildSpawnQueue(s.wave);
+        s.spawnTimer = 0;
+        s.waveInProgress = true;
+        s.waveNum = s.wave + 1;
+        syncUi(s);
+      }
+
+      // ── Tower management ──────────────────────────────────────────────────
+      function placeTower(slot) {
+        const s = stateRef.current;
+        if (!s) return;
+        if (s.coins < TOWER_COST) return;
+        if (slot.row === 'series') {
+          if (s.seriesTowers.some(t=>t.slotIdx===slot.idx)) return;
+          if (s.seriesTowers.length >= 3) return;
+          s.seriesTowers.push({id:uid(), slotIdx:slot.idx, fireTimer:0, x:slot.x, y:slot.y});
+        } else {
+          if (s.parallelTowers.some(t=>t.slotIdx===slot.idx)) return;
+          if (s.parallelTowers.length >= 3) return;
+          s.parallelTowers.push({id:uid(), slotIdx:slot.idx, fireTimer:0, x:slot.x, y:slot.y});
+        }
+        s.coins -= TOWER_COST;
+        // check fuse
+        checkFuse(s);
+        syncUi(s);
+      }
+
+      function removeTower(slot) {
+        const s = stateRef.current;
+        if (!s) return;
+        if (slot.row === 'series') {
+          const idx = s.seriesTowers.findIndex(t=>t.slotIdx===slot.idx);
+          if (idx < 0) return;
+          s.seriesTowers.splice(idx,1);
+        } else {
+          const idx = s.parallelTowers.findIndex(t=>t.slotIdx===slot.idx);
+          if (idx < 0) return;
+          s.parallelTowers.splice(idx,1);
+        }
+        s.coins += TOWER_SELL;
+        checkFuse(s);
+        syncUi(s);
+      }
+
+      function checkFuse(s) {
+        const circ = calcCircuit(s.seriesTowers.length, s.parallelTowers.length);
+        if (circ.I_total > FUSE_LIMIT && !s.fuseBlown) {
+          s.fuseBlown = true;
+          s.fuseTimer = FUSE_DURATION;
+        }
+      }
+
+      function resetFuse() {
+        const s = stateRef.current;
+        if (!s || !s.fuseBlown) return;
+        if (s.coins < FUSE_RESET_COST) return;
+        s.coins -= FUSE_RESET_COST;
+        s.fuseBlown = false;
+        s.fuseTimer = 0;
+        syncUi(s);
+      }
+
+      // ── Game loop ─────────────────────────────────────────────────────────
+      function startLoop() {
+        lastTRef.current = null;
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        function loop(ts) {
+          if (!lastTRef.current) lastTRef.current = ts;
+          const dt = Math.min((ts - lastTRef.current) / 1000, 0.05);
+          lastTRef.current = ts;
+          const s = stateRef.current;
+          if (s && (s.phase === 'building' || s.phase === 'wave')) {
+            update(s, dt);
+            draw(s);
+            syncUi(s); // throttle? OK for now
+          } else if (s && (s.phase === 'gameover' || s.phase === 'win')) {
+            draw(s);
+          }
+          rafRef.current = requestAnimationFrame(loop);
+        }
+        rafRef.current = requestAnimationFrame(loop);
+      }
+
+      function update(s, dt) {
+        const nS = s.seriesTowers.length;
+        const nP = s.parallelTowers.length;
+        const circ = calcCircuit(nS, nP);
+
+        // Fuse timer
+        if (s.fuseBlown) {
+          s.fuseTimer -= dt;
+          if (s.fuseTimer <= 0) { s.fuseBlown = false; s.fuseTimer = 0; }
+        }
+
+        // Spawn creeps
+        if (s.waveInProgress && s.spawnQueue.length > 0) {
+          s.spawnTimer += dt;
+          while (s.spawnQueue.length > 0 && s.spawnTimer >= s.spawnQueue[0].delay) {
+            const entry = s.spawnQueue.shift();
+            s.creeps.push(spawnCreep(entry.type, s.wave));
+          }
+        }
+
+        // Move creeps
+        for (let i = s.creeps.length - 1; i >= 0; i--) {
+          const c = s.creeps[i];
+          c.dist += c.speed * dt;
+          const pos = posAlongPath(PATH, c.dist);
+          c.x = pos.x; c.y = pos.y;
+          if (c.dist >= TOTAL_PATH_LEN) {
+            s.lives -= 1;
+            s.creeps.splice(i, 1);
+            // particle burst at end
+            spawnParticles(s, PATH[PATH.length-1].x, PATH[PATH.length-1].y, '#ff4444', 8);
+            if (s.lives <= 0) {
+              s.lives = 0;
+              s.phase = 'gameover';
+              return;
+            }
+          }
+        }
+
+        // Tower firing
+        if (!s.fuseBlown) {
+          const allTowers = [
+            ...s.seriesTowers.map(t=>({...t, row:'series', V: circ.V_series})),
+            ...s.parallelTowers.map(t=>({...t, row:'parallel', V: circ.V_parallel})),
+          ];
+          for (const tower of allTowers) {
+            if (tower.V <= 0) continue;
+            const fireRate = tower.V / V_BAT; // shots/sec
+            const towerObj = tower.row==='series'
+              ? s.seriesTowers.find(t=>t.id===tower.id)
+              : s.parallelTowers.find(t=>t.id===tower.id);
+            if (!towerObj) continue;
+            towerObj.fireTimer -= dt;
+            if (towerObj.fireTimer <= 0) {
+              towerObj.fireTimer = 1 / fireRate;
+              // find nearest creep in range
+              let nearest = null, nearDist = Infinity;
+              for (const c of s.creeps) {
+                const dx = c.x - tower.x, dy = c.y - tower.y;
+                const d = Math.sqrt(dx*dx+dy*dy);
+                if (d < TOWER_RANGE && d < nearDist) { nearest=c; nearDist=d; }
+              }
+              if (nearest) {
+                s.projectiles.push({
+                  id: uid(),
+                  x: tower.x, y: tower.y,
+                  tx: nearest.x, ty: nearest.y,
+                  targetId: nearest.id,
+                  speed: 280,
+                  damage: 1,
+                  color: tower.V >= V_BAT*0.8 ? '#00ffff' : tower.V >= V_BAT*0.5 ? '#aaff00' : '#ffaa00',
+                });
+              }
+            }
+          }
+        }
+
+        // Move projectiles
+        for (let i = s.projectiles.length - 1; i >= 0; i--) {
+          const p = s.projectiles[i];
+          // track target
+          const tgt = s.creeps.find(c=>c.id===p.targetId);
+          if (tgt) { p.tx = tgt.x; p.ty = tgt.y; }
+          const dx = p.tx - p.x, dy = p.ty - p.y;
+          const d = Math.sqrt(dx*dx+dy*dy);
+          if (d < 8) {
+            // hit
+            if (tgt) {
+              tgt.hp -= p.damage;
+              spawnParticles(s, tgt.x, tgt.y, '#ffaa00', 4);
+              if (tgt.hp <= 0) {
+                s.coins += 25;
+                spawnParticles(s, tgt.x, tgt.y, '#ffe600', 10);
+                const ci = s.creeps.indexOf(tgt);
+                if (ci >= 0) s.creeps.splice(ci, 1);
+              }
+            }
+            s.projectiles.splice(i, 1);
+          } else {
+            const spd = p.speed * dt;
+            p.x += (dx/d)*spd;
+            p.y += (dy/d)*spd;
+          }
+        }
+
+        // Particles
+        for (let i = s.particles.length - 1; i >= 0; i--) {
+          const p = s.particles[i];
+          p.x += p.vx * dt; p.y += p.vy * dt;
+          p.life -= dt;
+          if (p.life <= 0) s.particles.splice(i,1);
+        }
+
+        // Wave complete?
+        if (s.waveInProgress && s.spawnQueue.length === 0 && s.creeps.length === 0) {
+          s.waveInProgress = false;
+          s.wave += 1;
+          if (s.wave >= WAVES.length) {
+            s.phase = 'win';
+          }
+        }
+      }
+
+      function spawnParticles(s, x, y, color, n) {
+        for (let i = 0; i < n; i++) {
+          const ang = Math.random() * Math.PI * 2;
+          const spd = 40 + Math.random() * 80;
+          s.particles.push({
+            x, y,
+            vx: Math.cos(ang)*spd, vy: Math.sin(ang)*spd,
+            color, life: 0.4 + Math.random()*0.3,
+            r: 2 + Math.random()*3,
+          });
+        }
+      }
+
+      // ── Drawing ───────────────────────────────────────────────────────────
+      function draw(s) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const nS = s.seriesTowers.length;
+        const nP = s.parallelTowers.length;
+        const circ = calcCircuit(nS, nP);
+
+        ctx.fillStyle = '#0d0d0d';
+        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+        drawCircuitOverlay(ctx, s, circ, nS, nP);
+        drawPath(ctx);
+        drawRangeCircles(ctx, s, circ);
+        drawTowerSlots(ctx, s, circ);
+        drawCreeps(ctx, s);
+        drawProjectiles(ctx, s);
+        drawParticles(ctx, s);
+        drawHUD(ctx, s, circ);
+      }
+
+      function drawPath(ctx) {
+        ctx.save();
+        // Path fill
+        ctx.beginPath();
+        ctx.moveTo(PATH[0].x, PATH[0].y - 18);
+        for (let i = 1; i < PATH.length; i++) {
+          ctx.lineTo(PATH[i].x, PATH[i].y - 18);
+        }
+        for (let i = PATH.length-1; i >= 0; i--) {
+          ctx.lineTo(PATH[i].x, PATH[i].y + 18);
+        }
+        ctx.closePath();
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fill();
+        ctx.strokeStyle = '#2a2a2a';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Dashed center line
+        ctx.beginPath();
+        ctx.setLineDash([12, 10]);
+        ctx.moveTo(PATH[0].x, PATH[0].y);
+        for (let i = 1; i < PATH.length; i++) ctx.lineTo(PATH[i].x, PATH[i].y);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+
+        // END label
+        ctx.save();
+        ctx.font = '8px "Press Start 2P"';
+        ctx.fillStyle = '#ff4444';
+        ctx.textAlign = 'center';
+        ctx.fillText('END', 700, PATH_Y - 28);
+        ctx.restore();
+
+        // START label
+        ctx.save();
+        ctx.font = '8px "Press Start 2P"';
+        ctx.fillStyle = '#44ff88';
+        ctx.textAlign = 'center';
+        ctx.fillText('START', 0, PATH_Y - 28);
+        ctx.restore();
+      }
+
+      function drawCircuitOverlay(ctx, s, circ, nS, nP) {
+        const battX = 30, battY = 40;
+        const wireY = 62;
+        const blown = s.fuseBlown;
+
+        // Battery symbol
+        ctx.save();
+        ctx.font = '7px "Press Start 2P"';
+        ctx.fillStyle = '#00ff88';
+        ctx.textAlign = 'center';
+        ctx.fillText('12V', battX, battY - 8);
+        // Battery rect
+        ctx.strokeStyle = '#00ff88';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(battX - 14, battY - 4, 28, 14);
+        ctx.fillStyle = '#003322';
+        ctx.fillRect(battX - 14, battY - 4, 28, 14);
+        // fill level
+        const battFill = Math.min(1, s.lives / 5);
+        ctx.fillStyle = battFill > 0.5 ? '#00ff88' : battFill > 0.25 ? '#ffaa00' : '#ff4444';
+        ctx.fillRect(battX - 12, battY - 2, Math.floor(24 * battFill), 10);
+        ctx.strokeStyle = '#00ff88';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(battX - 14, battY - 4, 28, 14);
+        // +/- terminals
+        ctx.fillStyle = '#00ff88';
+        ctx.fillRect(battX + 14, battY - 1, 4, 8);
+        ctx.fillRect(battX - 18, battY + 2, 4, 2);
+        ctx.restore();
+
+        // Fuse symbol (top right)
+        const fuseX = CANVAS_W - 60, fuseY = 40;
+        ctx.save();
+        ctx.font = '7px "Press Start 2P"';
+        ctx.fillStyle = blown ? '#ff4444' : '#00ff88';
+        ctx.textAlign = 'center';
+        ctx.fillText('FUSE', fuseX, fuseY - 10);
+        ctx.strokeStyle = blown ? '#ff4444' : '#00ff88';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(fuseX - 16, fuseY - 4, 32, 14);
+        if (blown) {
+          // X mark
+          const t2 = Date.now() / 200;
+          if (Math.sin(t2) > 0) {
+            ctx.strokeStyle = '#ff4444';
+            ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(fuseX-8, fuseY-1); ctx.lineTo(fuseX+8, fuseY+8); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(fuseX+8, fuseY-1); ctx.lineTo(fuseX-8, fuseY+8); ctx.stroke();
+          }
+        } else {
+          ctx.strokeStyle = '#00ff88';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(fuseX-12, fuseY+3); ctx.lineTo(fuseX-6, fuseY); ctx.lineTo(fuseX+6, fuseY+7); ctx.lineTo(fuseX+12, fuseY+3);
+          ctx.stroke();
+        }
+        ctx.fillStyle = blown ? '#ff444488' : '#00ff8822';
+        ctx.fillRect(fuseX - 16, fuseY - 4, 32, 14);
+        ctx.restore();
+
+        // Current bar under fuse
+        const barX = fuseX - 30, barY = fuseY + 16, barW = 60;
+        const currentRatio = Math.min(circ.I_total / FUSE_LIMIT, 1);
+        ctx.save();
+        ctx.fillStyle = '#111';
+        ctx.fillRect(barX, barY, barW, 6);
+        const barColor = currentRatio > 0.85 ? '#ff4444' : currentRatio > 0.6 ? '#ffaa00' : '#00ffcc';
+        ctx.fillStyle = barColor;
+        ctx.fillRect(barX, barY, Math.floor(barW * currentRatio), 6);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(barX, barY, barW, 6);
+        ctx.font = '6px "Press Start 2P"';
+        ctx.fillStyle = '#aaa';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${circ.I_total.toFixed(1)}A / 10A`, fuseX, barY + 16);
+        ctx.restore();
+
+        // Wire from battery to series towers
+        const wireColor = blown ? '#333' : '#0088ff';
+        const wireGlow  = blown ? 'none' : '#0044ff';
+        ctx.save();
+        ctx.shadowColor = wireColor;
+        ctx.shadowBlur  = blown ? 0 : 8;
+        ctx.strokeStyle = wireColor;
+        ctx.lineWidth = 2;
+
+        // Main bus line
+        ctx.beginPath();
+        ctx.moveTo(battX + 14, battY + 3);
+        ctx.lineTo(battX + 14, wireY);
+        ctx.lineTo(SERIES_SLOTS[0].x, wireY);
+        ctx.stroke();
+
+        // Series tower wire (single run)
+        if (nS > 0) {
+          ctx.beginPath();
+          const lastS = SERIES_SLOTS[nS-1];
+          ctx.moveTo(SERIES_SLOTS[0].x, wireY);
+          ctx.lineTo(lastS.x, wireY);
+          // Drop wires to each series tower
+          for (let i = 0; i < nS; i++) {
+            ctx.moveTo(SERIES_SLOTS[i].x, wireY);
+            ctx.lineTo(SERIES_SLOTS[i].x, SERIES_SLOTS[i].y - 18);
+          }
+          ctx.stroke();
+          // Bridge to parallel
+          ctx.beginPath();
+          ctx.moveTo(lastS.x, wireY);
+          ctx.lineTo(PARALLEL_SLOTS[0].x, wireY);
+          ctx.stroke();
+        }
+
+        // Parallel towers (branching wires)
+        if (nP > 0) {
+          for (let i = 0; i < nP; i++) {
+            ctx.beginPath();
+            ctx.moveTo(PARALLEL_SLOTS[i].x, wireY);
+            ctx.lineTo(PARALLEL_SLOTS[i].x, PARALLEL_SLOTS[i].y - 18);
+            ctx.stroke();
+          }
+          ctx.beginPath();
+          ctx.moveTo(SERIES_SLOTS[nS > 0 ? nS-1 : 0].x, wireY);
+          ctx.lineTo(PARALLEL_SLOTS[nP-1].x, wireY);
+          ctx.stroke();
+        }
+
+        // Return wire to battery
+        ctx.beginPath();
+        const rightEnd = nP > 0 ? PARALLEL_SLOTS[nP-1].x : (nS > 0 ? SERIES_SLOTS[nS-1].x : 70);
+        ctx.moveTo(rightEnd, wireY);
+        ctx.lineTo(rightEnd, wireY + 10);
+        ctx.lineTo(battX - 14, wireY + 10);
+        ctx.lineTo(battX - 14, battY + 3);
+        ctx.stroke();
+
+        ctx.restore();
+
+        // Voltage labels on wires
+        if (nS > 0 && !blown) {
+          for (let i = 0; i < nS; i++) {
+            ctx.save();
+            ctx.font = '6px "Press Start 2P"';
+            ctx.fillStyle = '#00aaff';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${circ.V_series.toFixed(1)}V`, SERIES_SLOTS[i].x, wireY - 4);
+            ctx.restore();
+          }
+        }
+        if (nP > 0 && !blown) {
+          for (let i = 0; i < nP; i++) {
+            ctx.save();
+            ctx.font = '6px "Press Start 2P"';
+            ctx.fillStyle = '#ffee00';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${circ.V_parallel.toFixed(0)}V`, PARALLEL_SLOTS[i].x, wireY - 4);
+            ctx.restore();
+          }
+        }
+
+        // ROW LABELS
+        ctx.save();
+        ctx.font = '7px "Press Start 2P"';
+        ctx.fillStyle = '#0088ff';
+        ctx.textAlign = 'center';
+        ctx.fillText('SERIES', 230, 12);
+        ctx.fillStyle = '#ffee00';
+        ctx.fillText('PARALLEL', 500, 12);
+        ctx.restore();
+      }
+
+      function drawRangeCircles(ctx, s, circ) {
+        const allT = [
+          ...s.seriesTowers.map(t=>({...t, V: circ.V_series})),
+          ...s.parallelTowers.map(t=>({...t, V: circ.V_parallel})),
+        ];
+        for (const t of allT) {
+          const slot = ALL_SLOTS.find(sl=>sl.row===(s.seriesTowers.includes(t)?'series':'parallel') && sl.idx===t.slotIdx);
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, TOWER_RANGE, 0, Math.PI*2);
+          const alpha = s.fuseBlown ? 0.06 : 0.12;
+          ctx.fillStyle = `rgba(0,200,255,${alpha})`;
+          ctx.fill();
+          ctx.strokeStyle = s.fuseBlown ? '#333' : '#003344';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4,4]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.restore();
+        }
+      }
+
+      function drawTowerSlots(ctx, s, circ) {
+        // Draw each slot
+        for (const slot of ALL_SLOTS) {
+          const isSeries = slot.row === 'series';
+          const towers = isSeries ? s.seriesTowers : s.parallelTowers;
+          const tower = towers.find(t=>t.slotIdx===slot.idx);
+          const occupied = !!tower;
+          const V = occupied ? (isSeries ? circ.V_series : circ.V_parallel) : 0;
+          const blown = s.fuseBlown;
+
+          if (occupied) {
+            drawTower(ctx, slot.x, slot.y, V, blown, slot.row);
+          } else {
+            // Empty slot
+            ctx.save();
+            ctx.strokeStyle = isSeries ? '#0033aa' : '#555500';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4,4]);
+            ctx.strokeRect(slot.x - 14, slot.y - 14, 28, 28);
+            ctx.setLineDash([]);
+            ctx.font = '9px "Press Start 2P"';
+            ctx.fillStyle = isSeries ? '#0033aa' : '#555500';
+            ctx.textAlign = 'center';
+            ctx.fillText('+', slot.x, slot.y + 4);
+            ctx.restore();
+          }
+
+          // Slot label
+          ctx.save();
+          ctx.font = '6px "Press Start 2P"';
+          ctx.fillStyle = '#333';
+          ctx.textAlign = 'center';
+          ctx.fillText(slot.label, slot.x, slot.y + 24);
+          ctx.restore();
+        }
+      }
+
+      function drawTower(ctx, x, y, V, blown, row) {
+        const voltRatio = V / V_BAT;
+        const glowColor = blown ? '#333333' : (voltRatio > 0.75 ? '#00ffcc' : voltRatio > 0.45 ? '#aaff00' : '#ff8800');
+        const dimColor  = blown ? '#1a1a1a' : '#0a1a1a';
+
+        ctx.save();
+        if (!blown) {
+          ctx.shadowColor = glowColor;
+          ctx.shadowBlur  = 12;
+        }
+
+        // Base
+        ctx.fillStyle = blown ? '#1a1a1a' : '#112222';
+        ctx.fillRect(x - 10, y + 4, 20, 12);
+        ctx.strokeStyle = blown ? '#333' : '#005544';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x - 10, y + 4, 20, 12);
+
+        // Tower body
+        ctx.fillStyle = blown ? '#222' : '#0a2222';
+        ctx.fillRect(x - 6, y - 10, 12, 16);
+        ctx.strokeStyle = blown ? '#333' : '#004433';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x - 6, y - 10, 12, 16);
+
+        // Coil top
+        ctx.strokeStyle = glowColor;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.arc(x, y - 14, 7, Math.PI, 0);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, y - 10, 5, Math.PI, 0);
+        ctx.stroke();
+
+        // Top orb
+        ctx.beginPath();
+        ctx.arc(x, y - 18, 4, 0, Math.PI*2);
+        ctx.fillStyle = glowColor;
+        ctx.fill();
+
+        // Voltage label
+        if (!blown) {
+          ctx.font = '6px "Press Start 2P"';
+          ctx.fillStyle = glowColor;
+          ctx.textAlign = 'center';
+          ctx.shadowBlur = 0;
+          ctx.fillText(`${V.toFixed(1)}V`, x, y + 20);
+        }
+
+        ctx.restore();
+      }
+
+      function drawCreeps(ctx, s) {
+        for (const c of s.creeps) {
+          const hpRatio = c.hp / c.maxHp;
+          const isBoss = c.type === 'boss';
+          const isRes  = c.type === 'resistor';
+
+          ctx.save();
+          // Shadow
+          ctx.shadowColor = c.color;
+          ctx.shadowBlur  = isBoss ? 16 : 8;
+
+          // Body
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, c.r, 0, Math.PI*2);
+          ctx.fillStyle = c.color;
+          ctx.fill();
+
+          // Resistor markings
+          if (isRes) {
+            ctx.strokeStyle = '#ff4400';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.font = `${c.r - 2}px "Press Start 2P"`;
+            ctx.fillStyle = '#000';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('Ω', c.x, c.y);
+          } else if (isBoss) {
+            ctx.strokeStyle = '#ff0000';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            ctx.font = `8px "Press Start 2P"`;
+            ctx.fillStyle = '#000';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('!!', c.x, c.y);
+          } else {
+            // Simple face
+            ctx.fillStyle = '#000';
+            ctx.fillRect(c.x - 3, c.y - 3, 2, 2);
+            ctx.fillRect(c.x + 1, c.y - 3, 2, 2);
+            ctx.fillRect(c.x - 2, c.y + 1, 5, 1);
+          }
+
+          // HP bar
+          ctx.fillStyle = '#222';
+          ctx.fillRect(c.x - c.r, c.y - c.r - 8, c.r*2, 4);
+          ctx.fillStyle = hpRatio > 0.6 ? '#00ff66' : hpRatio > 0.3 ? '#ffaa00' : '#ff3333';
+          ctx.fillRect(c.x - c.r, c.y - c.r - 8, Math.floor(c.r*2*hpRatio), 4);
+          ctx.strokeStyle = '#444';
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(c.x - c.r, c.y - c.r - 8, c.r*2, 4);
+
+          // Boss label
+          if (isBoss) {
+            ctx.font = '7px "Press Start 2P"';
+            ctx.fillStyle = '#ff2200';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText('BOSS', c.x, c.y - c.r - 12);
+          }
+
+          ctx.restore();
+        }
+      }
+
+      function drawProjectiles(ctx, s) {
+        for (const p of s.projectiles) {
+          const dx = p.tx - p.x, dy = p.ty - p.y;
+          const ang = Math.atan2(dy, dx);
+
+          ctx.save();
+          ctx.shadowColor = p.color;
+          ctx.shadowBlur = 10;
+
+          // Lightning bolt shape (simple)
+          ctx.translate(p.x, p.y);
+          ctx.rotate(ang);
+          ctx.fillStyle = p.color;
+          ctx.fillRect(-5, -1, 10, 2);
+          // Bolt zigzag
+          ctx.beginPath();
+          ctx.moveTo(-4, -3); ctx.lineTo(0, 0); ctx.lineTo(-2, -1); ctx.lineTo(4, 3);
+          ctx.strokeStyle = p.color;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          // Core bright dot
+          ctx.beginPath();
+          ctx.arc(0, 0, 2, 0, Math.PI*2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+
+          ctx.restore();
+        }
+      }
+
+      function drawParticles(ctx, s) {
+        for (const p of s.particles) {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, p.life / 0.7);
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+          ctx.fillStyle = p.color;
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      function drawHUD(ctx, s, circ) {
+        // Lives (top right)
+        ctx.save();
+        ctx.font = '9px "Press Start 2P"';
+        ctx.fillStyle = '#ff4444';
+        ctx.textAlign = 'right';
+        ctx.fillText('♥'.repeat(s.lives) + '♡'.repeat(Math.max(0,5-s.lives)), CANVAS_W - 10, CANVAS_H - 10);
+        ctx.restore();
+
+        // Coins
+        ctx.save();
+        ctx.font = '9px "Press Start 2P"';
+        ctx.fillStyle = '#ffe600';
+        ctx.textAlign = 'left';
+        ctx.fillText(`⚡${s.coins}`, 10, CANVAS_H - 10);
+        ctx.restore();
+
+        // Wave
+        ctx.save();
+        ctx.font = '8px "Press Start 2P"';
+        ctx.fillStyle = '#aaa';
+        ctx.textAlign = 'center';
+        ctx.fillText(`WAVE ${s.waveNum} / ${WAVES.length}`, CANVAS_W/2, CANVAS_H - 10);
+        ctx.restore();
+
+        // Fuse blown overlay
+        if (s.fuseBlown) {
+          const t = Date.now()/300;
+          if (Math.sin(t) > 0) {
+            ctx.save();
+            ctx.font = '18px "Press Start 2P"';
+            ctx.fillStyle = '#ff2200';
+            ctx.textAlign = 'center';
+            ctx.shadowColor = '#ff4400';
+            ctx.shadowBlur = 30;
+            ctx.fillText('!! FUSE BLOWN !!', CANVAS_W/2, CANVAS_H/2 - 10);
+            ctx.font = '9px "Press Start 2P"';
+            ctx.fillStyle = '#ff8800';
+            ctx.shadowBlur = 10;
+            ctx.fillText(`TOWERS OFFLINE — ${s.fuseTimer.toFixed(1)}s`, CANVAS_W/2, CANVAS_H/2 + 16);
+            ctx.restore();
+          }
+        }
+
+        // Phase overlays
+        if (s.phase === 'gameover') {
+          ctx.save();
+          ctx.fillStyle = 'rgba(0,0,0,0.72)';
+          ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+          ctx.font = '22px "Press Start 2P"';
+          ctx.fillStyle = '#ff2200';
+          ctx.textAlign = 'center';
+          ctx.shadowColor = '#ff4400';
+          ctx.shadowBlur = 40;
+          ctx.fillText('GAME OVER', CANVAS_W/2, CANVAS_H/2 - 20);
+          ctx.font = '8px "Press Start 2P"';
+          ctx.fillStyle = '#888';
+          ctx.shadowBlur = 0;
+          ctx.fillText('CIRCUIT SHORTED — ALL LIFE LOST', CANVAS_W/2, CANVAS_H/2 + 14);
+          ctx.restore();
+        }
+        if (s.phase === 'win') {
+          ctx.save();
+          ctx.fillStyle = 'rgba(0,0,0,0.72)';
+          ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+          ctx.font = '18px "Press Start 2P"';
+          ctx.fillStyle = '#00ff88';
+          ctx.textAlign = 'center';
+          ctx.shadowColor = '#00ff88';
+          ctx.shadowBlur = 40;
+          ctx.fillText('CIRCUIT CLEARED!', CANVAS_W/2, CANVAS_H/2 - 20);
+          ctx.font = '8px "Press Start 2P"';
+          ctx.fillStyle = '#aaa';
+          ctx.shadowBlur = 0;
+          ctx.fillText('ALL WAVES DEFEATED', CANVAS_W/2, CANVAS_H/2 + 14);
+          ctx.restore();
+        }
+      }
+
+      // ── Handle canvas click ───────────────────────────────────────────────
+      function handleCanvasClick(e) {
+        const s = stateRef.current;
+        if (!s || s.phase === 'gameover' || s.phase === 'win' || s.phase === 'menu') return;
+        const rect = canvasRef.current.getBoundingClientRect();
+        const scaleX = CANVAS_W / rect.width;
+        const scaleY = CANVAS_H / rect.height;
+        const mx = (e.clientX - rect.left) * scaleX;
+        const my = (e.clientY - rect.top)  * scaleY;
+
+        for (const slot of ALL_SLOTS) {
+          if (Math.abs(mx - slot.x) < 18 && Math.abs(my - slot.y) < 18) {
+            const towers = slot.row === 'series' ? s.seriesTowers : s.parallelTowers;
+            const occupied = towers.some(t => t.slotIdx === slot.idx);
+            if (occupied) {
+              removeTower(slot);
+            } else {
+              placeTower(slot);
+            }
+            return;
+          }
+        }
+      }
+
+      // ── Cleanup ───────────────────────────────────────────────────────────
+      useEffect(() => {
+        return () => {
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        };
+      }, []);
+
+      // ── Derived values ────────────────────────────────────────────────────
+      const { circuit, fuseBlown, fuseTimer, coins, lives, wave,
+              seriesCount, parallelCount, waveInProgress, waveNum, creepsLeft, phase } = ui;
+      const I_total = circuit.I_total;
+      const currentRatio = Math.min(I_total / FUSE_LIMIT, 1);
+      const currentBarColor = currentRatio > 0.85 ? '#ff4444' : currentRatio > 0.6 ? '#ffaa00' : '#00ffcc';
+      const seriesFireRate = circuit.V_series > 0 ? (circuit.V_series / V_BAT).toFixed(2) : '0.00';
+      const parallelFireRate = circuit.V_parallel > 0 ? (circuit.V_parallel / V_BAT).toFixed(2) : '0.00';
+
+      const canStartWave = !waveInProgress && phase === 'building' && wave < WAVES.length;
+      const isGameOver = phase === 'gameover';
+      const isWin = phase === 'win';
+
+      // ── Render ─────────────────────────────────────────────────────────────
+      if (phase === 'menu') {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center" style={{background:'#0d0d0d'}}>
+            <div className="text-center space-y-6 px-4" style={{maxWidth:560}}>
+              <div>
+                <div className="pixel text-xs mb-4" style={{color:'#0044aa', letterSpacing:'0.15em'}}>PHYSICS ARCADE — SIMULATION 03</div>
+                <h1 className="pixel" style={{
+                  fontSize:28, color:'#00ccff',
+                  textShadow:'0 0 30px #00ccff, 0 0 60px #0066ff, 3px 3px 0 #003366',
+                  lineHeight:1.8
+                }}>CIRCUIT<br/>OVERLOAD</h1>
+                <div className="pixel text-xs mt-3" style={{color:'#005588'}}>OHM'S LAW TOWER DEFENSE</div>
+              </div>
+
+              <div className="pixel text-xs space-y-2 text-left mx-auto" style={{
+                color:'#336688', lineHeight:2, background:'#050d14', border:'1px solid #0a2a4a',
+                padding:'20px', borderRadius:8, maxWidth:480
+              }}>
+                <div style={{color:'#00aaff', marginBottom:8}}>HOW TO PLAY:</div>
+                <div>⚡ Click tower slots to build Tesla Coils (50 coins)</div>
+                <div>⚡ Click occupied slots to sell towers (25 coins)</div>
+                <div>⚡ Series Row: voltage SPLITS between towers</div>
+                <div>⚡ Parallel Row: each tower gets FULL voltage</div>
+                <div>⚡ More parallel towers = more current = blown FUSE!</div>
+                <div>⚡ Fire rate = V_received / 12 shots/second</div>
+                <div style={{color:'#ff8800', marginTop:8}}>⚠ Total current &gt; 10A = FUSE BLOWS (5s offline)</div>
+              </div>
+
+              <div className="pixel text-xs" style={{color:'#003344', lineHeight:2.5}}>
+                V = IR &nbsp;|&nbsp; P = IV &nbsp;|&nbsp; Series: V÷n &nbsp;|&nbsp; Parallel: I×n
+              </div>
+
+              <button
+                onClick={startGame}
+                className="pixel"
+                style={{
+                  background:'#001a33', border:'2px solid #00ccff', color:'#00ccff',
+                  padding:'14px 36px', fontSize:12, cursor:'pointer',
+                  boxShadow:'0 0 20px #00ccff44', borderRadius:4,
+                  letterSpacing:'0.1em'
+                }}
+              >
+                [ START GAME ]
+              </button>
+
+              <div>
+                <a href="index.html" className="pixel text-xs" style={{color:'#003344', textDecoration:'none'}}>← MENU</a>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div style={{background:'#0d0d0d', minHeight:'100vh', paddingBottom:24}}>
+          {/* Header */}
+          <div style={{
+            display:'flex', alignItems:'center', justifyContent:'space-between',
+            padding:'10px 16px', borderBottom:'1px solid #0a2a4a', background:'#050d14'
+          }}>
+            <a href="index.html" className="pixel" style={{color:'#003366', fontSize:8, textDecoration:'none'}}>← MENU</a>
+            <div className="text-center">
+              <div className="pixel" style={{
+                fontSize:12, color:'#00ccff',
+                textShadow:'0 0 16px #00ccff, 2px 2px 0 #003366'
+              }}>CIRCUIT OVERLOAD</div>
+              <div className="pixel" style={{fontSize:7, color:'#003355', marginTop:2}}>OHM'S LAW TOWER DEFENSE</div>
+            </div>
+            <div className="pixel" style={{fontSize:8, color:'#ffe600', textAlign:'right'}}>
+              <span style={{color:'#ffe600'}}>⚡{coins}</span>
+              <span style={{color:'#ff4444', marginLeft:12}}>{'♥'.repeat(lives)}{'♡'.repeat(Math.max(0,5-lives))}</span>
+            </div>
+          </div>
+
+          {/* Canvas area */}
+          <div style={{display:'flex', justifyContent:'center', padding:'12px 0 4px'}}>
+            <div style={{position:'relative'}}>
+              <canvas
+                ref={canvasRef}
+                width={CANVAS_W}
+                height={CANVAS_H}
+                style={{
+                  border:'2px solid #0a2a4a',
+                  boxShadow:'0 0 30px #001a3344',
+                  borderRadius:4,
+                  cursor:'crosshair',
+                  maxWidth:'100%',
+                }}
+                onClick={handleCanvasClick}
+              />
+            </div>
+          </div>
+
+          {/* Controls row */}
+          <div style={{display:'flex', justifyContent:'center', gap:10, padding:'8px 16px', flexWrap:'wrap'}}>
+            <button
+              className="pixel btn-buy"
+              onClick={startWave}
+              disabled={!canStartWave || isGameOver || isWin}
+              style={{
+                background: canStartWave ? '#002200' : '#111',
+                border:`2px solid ${canStartWave ? '#00ff66' : '#333'}`,
+                color: canStartWave ? '#00ff66' : '#555',
+                padding:'8px 16px', fontSize:9, cursor: canStartWave ? 'pointer' : 'not-allowed',
+                borderRadius:4, fontFamily:'Press Start 2P',
+              }}
+            >
+              {waveInProgress
+                ? `WAVE ${waveNum} — ${creepsLeft} LEFT`
+                : wave >= WAVES.length
+                  ? 'ALL WAVES DONE!'
+                  : `▶ START WAVE ${wave + 1}`}
+            </button>
+
+            <button
+              className="pixel btn-buy"
+              onClick={resetFuse}
+              disabled={!fuseBlown || coins < FUSE_RESET_COST}
+              style={{
+                background: fuseBlown ? '#220000' : '#111',
+                border:`2px solid ${fuseBlown ? '#ff4444' : '#333'}`,
+                color: fuseBlown ? '#ff4444' : '#444',
+                padding:'8px 16px', fontSize:9,
+                cursor: fuseBlown && coins >= FUSE_RESET_COST ? 'pointer' : 'not-allowed',
+                borderRadius:4, fontFamily:'Press Start 2P',
+                ...(fuseBlown ? {animation:'pulse-glow 0.5s ease-in-out infinite'} : {}),
+              }}
+            >
+              {fuseBlown
+                ? `⚡ RESET FUSE (-${FUSE_RESET_COST}¢) ${fuseTimer.toFixed(1)}s`
+                : '🔌 FUSE: OK'}
+            </button>
+
+            {(isGameOver || isWin) && (
+              <button
+                className="pixel btn-buy"
+                onClick={startGame}
+                style={{
+                  background:'#001a33', border:'2px solid #00ccff', color:'#00ccff',
+                  padding:'8px 16px', fontSize:9, cursor:'pointer', borderRadius:4,
+                  fontFamily:'Press Start 2P',
+                }}
+              >
+                ↺ PLAY AGAIN
+              </button>
+            )}
+          </div>
+
+          {/* Physics panel */}
+          <div style={{
+            maxWidth:700, margin:'8px auto 0', padding:'0 12px'
+          }}>
+            <div style={{
+              background:'#050d14', border:'1px solid #0a2244',
+              borderRadius:6, padding:'14px 16px',
+            }}>
+              {/* Title */}
+              <div className="pixel" style={{fontSize:8, color:'#0044aa', marginBottom:10, letterSpacing:'0.1em'}}>
+                ⚡ LIVE CIRCUIT READOUT
+              </div>
+
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
+                {/* Series */}
+                <div style={{background:'#030b18', border:'1px solid #003366', borderRadius:4, padding:10}}>
+                  <div className="pixel" style={{fontSize:7, color:'#0066aa', marginBottom:8}}>SERIES ROW</div>
+                  <div className="pixel" style={{fontSize:7, color:'#aaa', lineHeight:2.2}}>
+                    <div>Towers: <span style={{color:'#00aaff'}}>{seriesCount} / 3</span></div>
+                    <div>V each: <span style={{color:'#00ccff'}}>{seriesCount > 0 ? circuit.V_series.toFixed(2) : '0.00'}V</span></div>
+                    <div>I series: <span style={{color:'#00ccff'}}>{circuit.I_series.toFixed(2)}A</span></div>
+                    <div>Fire rate: <span style={{color:'#00ffcc'}}>{seriesFireRate} /s</span></div>
+                    <div style={{marginTop:4, color:'#004466', fontSize:6}}>V_each = {V_BAT}V ÷ {seriesCount||'n'}</div>
+                  </div>
+                </div>
+
+                {/* Parallel */}
+                <div style={{background:'#0d0d03', border:'1px solid #444400', borderRadius:4, padding:10}}>
+                  <div className="pixel" style={{fontSize:7, color:'#888800', marginBottom:8}}>PARALLEL ROW</div>
+                  <div className="pixel" style={{fontSize:7, color:'#aaa', lineHeight:2.2}}>
+                    <div>Towers: <span style={{color:'#ffee00'}}>{parallelCount} / 3</span></div>
+                    <div>V each: <span style={{color:'#ffee00'}}>{parallelCount > 0 ? '12.00' : '0.00'}V</span></div>
+                    <div>I each: <span style={{color:'#ffee00'}}>{parallelCount > 0 ? (V_BAT / TOWER_R).toFixed(2) : '0.00'}A</span></div>
+                    <div>I total: <span style={{color:'#ffee00'}}>{circuit.I_parallel.toFixed(2)}A</span></div>
+                    <div>Fire rate: <span style={{color:'#aaff00'}}>{parallelFireRate} /s</span></div>
+                    <div style={{marginTop:4, color:'#444400', fontSize:6}}>I_total = n × {V_BAT}V ÷ {TOWER_R}Ω</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Total current bar */}
+              <div style={{marginTop:12}}>
+                <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:5}}>
+                  <div className="pixel" style={{fontSize:7, color:'#aaa'}}>TOTAL CURRENT</div>
+                  <div className="pixel" style={{
+                    fontSize:8,
+                    color: fuseBlown ? '#ff4444' : currentRatio > 0.85 ? '#ff8800' : '#00ffcc',
+                  }}>
+                    {fuseBlown ? 'FUSE BLOWN!' : `${I_total.toFixed(2)}A / ${FUSE_LIMIT}A`}
+                  </div>
+                </div>
+                <div style={{background:'#111', borderRadius:3, height:10, overflow:'hidden', border:'1px solid #222'}}>
+                  <div style={{
+                    height:'100%',
+                    width:`${Math.min(currentRatio * 100, 100)}%`,
+                    background: currentBarColor,
+                    boxShadow:`0 0 8px ${currentBarColor}`,
+                    transition:'width 0.2s, background 0.2s',
+                  }}/>
+                </div>
+                <div style={{display:'flex', justifyContent:'space-between'}}>
+                  <div className="pixel" style={{fontSize:5, color:'#333', marginTop:3}}>0A (safe)</div>
+                  <div className="pixel" style={{fontSize:5, color:'#ff3300', marginTop:3}}>10A (fuse limit)</div>
+                </div>
+              </div>
+
+              {/* Power */}
+              <div style={{marginTop:10, display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                <div className="pixel" style={{fontSize:7, color:'#555'}}>TOTAL POWER:</div>
+                <div className="pixel" style={{fontSize:8, color:'#ff8800'}}>
+                  {fuseBlown ? '0.00W' : `${ui.totalPower.toFixed(2)}W`}
+                </div>
+              </div>
+
+              {/* Equation reminders */}
+              <div style={{
+                marginTop:12, padding:'8px 10px',
+                background:'#0a0a0a', border:'1px solid #1a1a1a', borderRadius:4,
+              }}>
+                <div className="pixel" style={{fontSize:6, color:'#2a3a5a', lineHeight:2.5, textAlign:'center'}}>
+                  <span style={{color:'#1a3a7a'}}>V = IR</span>
+                  {' | '}
+                  <span style={{color:'#1a3a7a'}}>P = IV</span>
+                  {' | '}
+                  <span style={{color:'#2a4400'}}>Series: V÷n, same I</span>
+                  {' | '}
+                  <span style={{color:'#332200'}}>Parallel: V same, I×n</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Slot legend */}
+          <div style={{maxWidth:700, margin:'8px auto 0', padding:'0 12px'}}>
+            <div className="pixel" style={{fontSize:6, color:'#1a2a3a', textAlign:'center', lineHeight:2.5}}>
+              Click empty slot to buy tower (⚡{TOWER_COST}) &nbsp;|&nbsp; Click tower to sell (⚡{TOWER_SELL}) &nbsp;|&nbsp; Emergency fuse reset: ⚡{FUSE_RESET_COST}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
